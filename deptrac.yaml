@@ -1,0 +1,19 @@
+deptrac:
+  paths:
+    - ./src
+
+  layers:
+    - name: Public
+      collectors:
+        - type: classLike
+          value: ^Krvh\\MinimalPhpAsync\\(Async|Runtime|Task|HttpException)$
+
+    - name: Internal
+      collectors:
+        - type: classLike
+          value: ^Krvh\\MinimalPhpAsync\\(IoWatcher|Timer)$
+
+  ruleset:
+    Public:
+      - Internal
+    Internal: []

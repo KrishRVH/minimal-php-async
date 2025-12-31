@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit
+    bootstrap="vendor/autoload.php"
+    cacheDirectory=".phpunit.cache"
+    colors="true"
+    executionOrder="random"
+    resolveDependencies="true"
+    failOnDeprecation="true"
+    failOnPhpunitDeprecation="true"
+    failOnPhpunitNotice="true"
+    failOnPhpunitWarning="true"
+    failOnEmptyTestSuite="true"
+    failOnIncomplete="true"
+    failOnNotice="true"
+    failOnRisky="true"
+    failOnSkipped="true"
+    failOnWarning="true"
+    beStrictAboutChangesToGlobalState="true"
+    beStrictAboutOutputDuringTests="true"
+    beStrictAboutTestsThatDoNotTestAnything="true"
+>
+    <php>
+        <ini name="error_reporting" value="-1"/>
+        <ini name="display_errors" value="1"/>
+    </php>
+    <testsuites>
+        <testsuite name="unit">
+            <directory>tests</directory>
+        </testsuite>
+    </testsuites>
+</phpunit>
