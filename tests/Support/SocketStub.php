@@ -15,6 +15,7 @@ final class SocketStub
     private static int $counter = 0;
     private static ?string $nextResponse = null;
     private static bool $failNext = false;
+    private static bool $silentFailNext = false;
     private static ?string $lastAddress = null;
     /** @var array<array-key, mixed>|null */
     private static ?array $lastContextOptions = null;
@@ -24,6 +25,7 @@ final class SocketStub
         self::$counter = 0;
         self::$nextResponse = null;
         self::$failNext = false;
+        self::$silentFailNext = false;
         self::$lastAddress = null;
         self::$lastContextOptions = null;
         FakeSocketStream::reset();
@@ -39,6 +41,13 @@ final class SocketStub
     public static function queueFailure(): void
     {
         self::$failNext = true;
+        self::$nextResponse = null;
+    }
+
+    public static function queueSilentFailure(): void
+    {
+        self::$silentFailNext = true;
+        self::$failNext = false;
         self::$nextResponse = null;
     }
 
@@ -82,6 +91,11 @@ final class SocketStub
     ): mixed {
         self::$lastAddress = $address;
         self::$lastContextOptions = is_resource($context) ? stream_context_get_options($context) : null;
+
+        if (self::$silentFailNext) {
+            self::$silentFailNext = false;
+            return false;
+        }
 
         if (self::$failNext) {
             self::$failNext = false;

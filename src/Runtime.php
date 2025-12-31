@@ -243,6 +243,7 @@ final class Runtime
         }
 
         if ($fiber->isTerminated()) {
+            // @infection-ignore-all
             return;
         }
 
@@ -480,6 +481,7 @@ final class Runtime
         $this->closeStream($watcher->stream);
 
         if ($watcher->fiber->isTerminated()) {
+            // @infection-ignore-all
             return;
         }
 

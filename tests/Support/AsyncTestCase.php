@@ -15,6 +15,7 @@ abstract class AsyncTestCase extends TestCase
     public static function setUpBeforeClass(): void
     {
         require_once __DIR__ . '/SocketOverrides.php';
+        require_once __DIR__ . '/TimeOverrides.php';
     }
 
     #[Override]
@@ -25,6 +26,8 @@ abstract class AsyncTestCase extends TestCase
 
         SocketStub::reset();
         SelectStub::reset();
+        SleepStub::reset();
+        TimeStub::reset();
 
         parent::tearDown();
     }

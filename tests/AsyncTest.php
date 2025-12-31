@@ -544,6 +544,21 @@ final class AsyncTest extends AsyncTestCase
         ]);
     }
 
+    public function testOpenStreamFailureUsesDefaultErrorCode(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Connect failed: Unknown error');
+        $this->expectExceptionCode(0);
+        SocketStub::queueSilentFailure();
+        TestHelper::callPrivateStatic(Async::class, 'openStream', [
+            'http',
+            'example.test',
+            80,
+            0.1,
+            true,
+        ]);
+    }
+
     public function testOpenStreamUsesSslAndVerifyOptions(): void
     {
         $response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -674,6 +689,15 @@ final class AsyncTest extends AsyncTestCase
     {
         $body = TestHelper::callPrivateStatic(Async::class, 'decodeChunked', ["1\r\nA\r\n2\r\nBC\r\n0\r\n\r\n"]);
         $this->assertSame('ABC', $body);
+    }
+
+    public function testReadChunkReturnsRemainderWithoutCrlf(): void
+    {
+        /** @var array{0: string, 1: string} $parts */
+        $parts = TestHelper::callPrivateStatic(Async::class, 'readChunk', ["A\r\nNEXT", 1]);
+        [$chunk, $rest] = $parts;
+        $this->assertSame('A', $chunk);
+        $this->assertSame('NEXT', $rest);
     }
 
     public function testDecodeChunkedAcceptsEmptyTrailer(): void

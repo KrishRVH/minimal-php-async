@@ -18,7 +18,9 @@ use Krvh\MinimalPhpAsync\Task;
 use Krvh\MinimalPhpAsync\Tests\Support\AsyncTestCase;
 use Krvh\MinimalPhpAsync\Tests\Support\FailingReadStream;
 use Krvh\MinimalPhpAsync\Tests\Support\SelectStub;
+use Krvh\MinimalPhpAsync\Tests\Support\SleepStub;
 use Krvh\MinimalPhpAsync\Tests\Support\TestHelper;
+use Krvh\MinimalPhpAsync\Tests\Support\TimeStub;
 use Krvh\MinimalPhpAsync\Timer;
 use LogicException;
 use RuntimeException;
@@ -897,6 +899,24 @@ final class RuntimeTest extends AsyncTestCase
         $this->assertIsFloat($next);
     }
 
+    public function testProcessTimersResumesTimersAtExactNow(): void
+    {
+        $runtime = new Runtime();
+        $fiber = TestHelper::newSuspendedFiber();
+        $now = 1000.0;
+
+        TimeStub::freeze($now);
+
+        TestHelper::setProperty($runtime, 'timers', [
+            new Timer($now, $fiber),
+        ]);
+
+        TestHelper::callPrivate($runtime, 'processTimers');
+
+        $this->assertTrue($fiber->isTerminated());
+        $this->assertSame([], TestHelper::getProperty($runtime, 'timers'));
+    }
+
     public function testTickReturnsWhenNoIoOrTimers(): void
     {
         $runtime = new Runtime();
@@ -912,12 +932,37 @@ final class RuntimeTest extends AsyncTestCase
     {
         $runtime = new Runtime();
         $future = TestHelper::newSuspendedFiber();
+        SleepStub::force();
 
         TestHelper::setProperty($runtime, 'timers', [
-            new Timer(microtime(true) + 0.01, $future),
+            new Timer(microtime(true) + 0.05, $future),
         ]);
 
         TestHelper::callPrivate($runtime, 'tick');
+        $this->assertGreaterThan(0, SleepStub::callCount());
+        $last = SleepStub::lastMicroseconds();
+        $this->assertNotNull($last);
+        $this->assertGreaterThan(0, $last);
+        /** @var array<int, Timer> $timers */
+        $timers = TestHelper::getProperty($runtime, 'timers');
+        $this->assertCount(1, $timers);
+    }
+
+    public function testTickSkipsSleepWhenTimeCatchesUp(): void
+    {
+        $runtime = new Runtime();
+        $future = TestHelper::newSuspendedFiber();
+
+        TimeStub::queue(1000.0, 1000.5);
+        SleepStub::force();
+
+        TestHelper::setProperty($runtime, 'timers', [
+            new Timer(1000.5, $future),
+        ]);
+
+        TestHelper::callPrivate($runtime, 'tick');
+
+        $this->assertSame(0, SleepStub::callCount());
         /** @var array<int, Timer> $timers */
         $timers = TestHelper::getProperty($runtime, 'timers');
         $this->assertCount(1, $timers);
@@ -983,7 +1028,8 @@ final class RuntimeTest extends AsyncTestCase
     public function testSelectStreamsComputesShortTimeout(): void
     {
         SelectStub::forceResult(0);
-        $nextTimerAt = microtime(true) + 0.25;
+        TimeStub::freeze(1000.0);
+        $nextTimerAt = 1000.25;
 
         $runtime = new Runtime();
         TestHelper::callPrivate($runtime, 'selectStreams', [[], [], $nextTimerAt]);
@@ -993,7 +1039,7 @@ final class RuntimeTest extends AsyncTestCase
             $this->fail('Expected microseconds');
         }
         $this->assertSame(0, $timeout['seconds']);
-        $this->assertLessThan(1_000_000, $timeout['microseconds']);
+        $this->assertSame(250_000, $timeout['microseconds']);
     }
 
     public function testSelectStreamsComputesLongTimeout(): void

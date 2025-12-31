@@ -79,6 +79,7 @@ final class TaskTest extends AsyncTestCase
         $task->setFiber($fiber);
 
         $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('Circular await detected');
         $fiber->start();
     }
 

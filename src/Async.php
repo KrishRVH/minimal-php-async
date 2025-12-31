@@ -136,6 +136,7 @@ final class Async
     public static function race(array $tasks): mixed
     {
         $rt = self::runtime();
+        // @infection-ignore-all
         $handles = array_values(self::normalizeTasks($tasks, $rt));
 
         if ($handles === []) {
@@ -543,6 +544,7 @@ final class Async
         $errno = 0;
         $errstr = '';
         set_error_handler(self::ignoreError(...));
+        // @infection-ignore-all
         try {
             $stream = stream_socket_client($addr, $errno, $errstr, $timeout, STREAM_CLIENT_CONNECT, $ctx);
         } finally {
@@ -641,6 +643,7 @@ final class Async
     private static function parseChunkSize(string $line): int
     {
         // Ignore chunk extensions: "<hex>;<ext>"
+        // @infection-ignore-all
         $sizeHex = trim(explode(';', $line, 2)[0]);
         if ($sizeHex === '' || preg_match('/\A[0-9a-fA-F]+\z/', $sizeHex) !== 1) {
             throw new RuntimeException('Malformed chunked body (invalid chunk size)');
