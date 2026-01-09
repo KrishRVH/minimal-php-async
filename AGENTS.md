@@ -1,39 +1,40 @@
 # Repository Guidelines
 
+This repository contains a minimal async runtime implementation for PHP 8.5. Use Composer scripts for all tooling; there is no separate build step beyond dependency installation.
+
 ## Project Structure & Module Organization
-- `src/`: runtime, Async API, and internal helpers (namespace `Krvh\MinimalPhpAsync\`).
-- `tests/`: PHPUnit tests; shared helpers live in `tests/Support/`.
-- `benchmarks/`: PHPBench cases; `fuzz/`: php-fuzzer harness and corpus.
-- `scripts/`: helper runners for coverage, infection, and BC checks.
-- Config: `phpunit.xml`, `phpcs.xml`, `phpstan.neon`, `psalm.xml`, `deptrac.yaml`, `infection.json5`, `rector.php`.
+- `src/`: core runtime classes under the `Krvh\MinimalPhpAsync` namespace.
+- `tests/`: PHPUnit tests; `tests/Support/` holds stubs, fixtures, and helper utilities.
+- `benchmarks/`: phpbench scenarios for performance checks.
+- `fuzz/`: fuzz targets plus corpus and coverage artifacts.
+- `scripts/`: Composer-driven helpers (coverage, infection, backward-compatibility).
+- `vendor/`: Composer-managed dependencies (generated; do not edit).
 
 ## Build, Test, and Development Commands
-- `composer test`: run PHPUnit.
-- `composer lint`: run `phpcs`, `phpmd`, `phpstan`, `psalm`, `phan`, and `deptrac`.
-- `composer check`: lint + tests.
-- `composer ci`: check + mutation tests.
-- `composer coverage`: generate coverage (requires Xdebug or pcov).
-- `composer infection`: mutation testing via `scripts/infection.php`.
-- `composer bench`: run PHPBench benchmarks.
-- `composer fuzz:smoke`: quick fuzz pass.
-- `composer deep-check`: full suite including dependency and BC checks.
+- `composer install`: install dependencies for local development.
+- `composer test`: run the PHPUnit suite.
+- `composer lint`: run style checks plus static analysis and deptrac.
+- `composer analyze`: run phpstan, psalm, and phan.
+- `composer check`: lint + unit tests (use for quick verification).
+- `composer ci`: check + mutation testing (infection).
+- `composer bench`: run phpbench benchmarks.
+- `composer fuzz:smoke`: short fuzz run for regression detection.
 
 ## Coding Style & Naming Conventions
-- PSR-12 baseline with strict typing; keep `declare(strict_types=1);`.
-- 4-space indentation, line length 120 soft / 150 hard (`phpcs.xml`).
-- Prefer typed properties/params/returns; avoid forbidden debug functions (`var_dump`, `die`, etc.).
-- Classes in `src/` use StudlyCase; tests named `*Test.php`.
+- PSR-12 baseline with Slevomat rules enforced by `phpcs` (`composer phpcs`, auto-fix with `composer phpcbf`).
+- 4-space indentation, `declare(strict_types=1);` at the top of PHP files.
+- Class names match file names; namespaces follow `Krvh\MinimalPhpAsync` and `Krvh\MinimalPhpAsync\Tests`.
+- Test files use the `*Test.php` suffix.
 
 ## Testing Guidelines
-- Framework: PHPUnit (see `phpunit.xml`).
-- Place tests in `tests/` mirroring `src/` structure; helpers belong in `tests/Support/`.
-- Mutation targets are strict (MSI >= 90, covered MSI >= 95); update tests when changing behavior.
-
-## Architecture & Constraints
-- `Async` is the public facade; `Runtime`, `Task`, and DTOs are internal.
-- Layering is enforced by `deptrac.yaml`; keep internal dependencies one-way.
+- PHPUnit config lives in `phpunit.xml`; tests are random order and fail on warnings/skips, so avoid shared global state.
+- Keep fixtures and fakes in `tests/Support/` rather than inline in tests.
+- Use `composer coverage` and `composer infection` for deeper verification when changing core runtime behavior.
 
 ## Commit & Pull Request Guidelines
-- Commit history shows short, descriptive messages without prefixes; keep them concise and action-oriented (e.g., "fix timer cancellation").
-- PRs should include a clear summary, rationale, and the checks run (at least `composer test`; add `composer lint` for non-trivial changes).
-- Mention any API changes and update docs/tests accordingly.
+- Recent commits use short, lowercase, imperative summaries (e.g., "tooling update"); follow that style unless a new convention is agreed.
+- PRs should state intent, impact, and list commands run (e.g., `composer check` or `composer ci`).
+- Link related issues and update tests/docs when changing public APIs.
+
+## Configuration Notes
+- PHP >=8.5 is required; some dev tools expect `ext-pcntl` (see `composer.json`).

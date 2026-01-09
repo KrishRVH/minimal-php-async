@@ -1,192 +1,236 @@
-# Minimal PHP Async
+# minimal-php-async
 
-A minimal, fiber-based async runtime for PHP 8.5. This is a learning-oriented
-library that demonstrates structured concurrency, cooperative scheduling, and a
-very small async I/O layer built on `stream_select`.
+Minimal, educational async runtime for PHP 8.5 built on Fibers. It provides a
+structured concurrency facade, a tiny event loop, and a minimal HTTP/1.1 client
+used purely to demonstrate async I/O.
 
-## Status
-Experimental and intentionally small. It is not a general-purpose event loop
-and does not aim to replace production async runtimes.
+## Overview
+- Package name: `krvh/minimal-php-async`
+- Namespace: `Krvh\MinimalPhpAsync`
+- License: MIT
+- Runtime dependencies: none (only `php >= 8.5`)
+- Dev tooling is extensive (static analysis, mutation testing, fuzzing, and
+  benchmarks) and is driven through Composer scripts.
 
-## Goals
-- Provide a tiny, readable async runtime built on Fibers.
-- Demonstrate structured concurrency (parent/child task tracking).
-- Offer basic async I/O primitives (`readAll`, `write`) and timers.
-- Include a minimal HTTP fetch helper for examples and tests.
+## Requirements
+- PHP 8.5+ (uses clone-with, `array_all`, `array_any`, `array_find`, and
+  readonly classes).
+- `ext-pcntl` is optional but enables test timeouts.
+- Xdebug or pcov is required for coverage and mutation testing; otherwise
+  coverage runs fall back to tests only and Infection is skipped.
 
-## Non-goals
-- Full-featured HTTP client (no keep-alive, no streaming, no pipelining).
-- High scalability or advanced event loop integrations (epoll/kqueue).
-- Preemptive scheduling or multi-threading.
+## Project Layout
+- `src/`: core runtime (`Async`, `Runtime`, `Task`, `HttpException`,
+  internal `IoWatcher` and `Timer`).
+- `tests/`: PHPUnit suite plus deterministic stream/time stubs in
+  `tests/Support/`.
+- `benchmarks/`: phpbench microbenchmarks.
+- `fuzz/`: php-fuzzer target and dictionary.
+- `scripts/`: helper wrappers for coverage, infection, and BC checks.
+- `phpunit.xml`, `phpstan.neon`, `psalm.xml`, `phpcs.xml`, `phpmd.xml`,
+  `rector.php`, `deptrac.yaml`: quality gate configs.
+- `.phan/phan.phar`: bundled Phan PHAR used by `composer phan`.
 
-## Architecture Overview
-The public API is intentionally small, with a few internal helpers.
+## Public API Specification
 
-| Component | Role | Notes |
-| --- | --- | --- |
-| `Async` | Static facade | Entry point; owns the default `Runtime`. |
-| `Runtime` | Scheduler | Manages Fibers, I/O watchers, timers, cancellation. |
-| `Task` | Handle | Awaitable result of a queued Fiber. |
-| `HttpException` | Error | Thrown by `Async::fetch()` on HTTP status >= 400. |
-| `IoWatcher` | Internal | Immutable DTO for read/write watchers. |
-| `Timer` | Internal | Immutable DTO for wakeup times. |
+### Async (static facade)
+Core usage is via `Async` which owns a runtime instance:
 
-The dependency boundary is enforced by `deptrac.yaml`: public classes may
-depend on internal ones, but not vice versa.
-
-## Execution Model
-The runtime is single-threaded and cooperative. Fibers yield only when they
-explicitly call runtime primitives.
-
-```text
-Async::spawn(fn) -> Runtime::queue -> Fiber::start
-Task::await (root) -> Runtime::drive -> tick -> select -> resume Fiber
-Task::await (fiber) -> suspend current Fiber until target completes
-```
-
-### Core scheduling rules
-- `Runtime::drive()` runs the event loop until a condition is true, or throws
-  `RuntimeException` if no I/O or timers remain (deadlock detection).
-- `Runtime::tick()` advances timers, then waits on I/O via `stream_select`.
-- `Runtime::delay(0)` is a cooperative "yield": resume on the next tick.
-
-## Public API (RFC-level semantics)
-
-### Tasks and structured concurrency
 ```php
 use Krvh\MinimalPhpAsync\Async;
 
-$task = Async::spawn(fn() => 42);
-$value = $task->await();
-
-$results = Async::all([
-    'a' => fn() => 1,
-    'b' => fn() => 2,
-]);
-
-$winner = Async::race([
-    fn() => 'fast',
-    fn() => (Async::sleep(0.01) || 'slow'),
-]);
-```
-
-- `Async::spawn(Closure): Task` queues work on the current runtime.
-- `Async::run(Closure): mixed` spawns then awaits (root-safe).
-- `Async::all(array<Task|Closure>): array` waits for all; preserves input keys.
-- `Async::race(array<Task|Closure>): mixed` returns first; cancels others.
-- `Async::timeout(Closure, float $sec): mixed` races work vs a timer task.
-- `Async::sleep(float $sec)` suspends the current Fiber; throws if called from
-  the root context (no Fiber to suspend).
-
-### Error propagation
-- Exceptions inside Fibers are captured and rethrown on `Task::await()`.
-- `Task::result()` returns a resolved value without driving the runtime and
-  throws if the task is incomplete (internal use).
-- Circular `await()` is rejected with `LogicException`.
-
-### Cancellation
-`Task::cancel()` performs best-effort cancellation:
-1. Recursively cancels child tasks spawned by the current task.
-2. Cleans up I/O watchers and closes their streams.
-3. Removes pending timers for the canceled Fiber.
-4. Throws `RuntimeException("Task cancelled")` into the Fiber when possible.
-
-Cancellation errors are intentionally suppressed to avoid cascading failures.
-
-## I/O and Timers (Runtime primitives)
-
-### Timers
-```php
-Async::run(function () {
-    Async::sleep(0.05);
-    return 'ok';
+$result = Async::run(static function (): array {
+    $a = Async::spawn(static fn(): int => 1);
+    $b = Async::spawn(static fn(): int => 2);
+    return Async::all(['a' => $a, 'b' => $b]);
 });
 ```
 
-`Runtime::delay(float $seconds)` records a `Timer` and suspends the Fiber. The
-Fiber is resumed once the deadline is reached.
+Methods and behavior:
+- `withRuntime(Runtime $runtime, Closure $fn): mixed`
+  swaps the global runtime for the duration of `$fn` and always restores it.
+- `spawn(Closure $fn): Task`
+  queues work on the current runtime and returns a `Task`.
+- `run(Closure $fn): mixed`
+  spawns and awaits the task (drives the loop if called from root).
+- `sleep(float $seconds): void`
+  suspends the current Fiber for at least `$seconds`; throws `LogicException`
+  when called outside a runtime-managed Fiber.
+- `all(array $tasks): array`
+  accepts `Task` instances or closures and returns results preserving keys.
+- `race(array $tasks): mixed`
+  awaits the first completion, cancels the rest, and returns the winner.
+  Requires at least one task.
+- `timeout(Closure $fn, float $sec): mixed`
+  races `$fn` against a timer; throws `RuntimeException("Timeout {$sec}s")`
+  if the timer wins.
+- `fetch(string $url, array $opts = []): string`
+  minimal HTTP/1.1 client that reads until EOF and decodes chunked bodies.
+- `fetchJson(string $url, array $opts = []): mixed`
+  adds `Accept: application/json` and decodes with `JSON_THROW_ON_ERROR`.
 
-### Non-blocking I/O
+### Runtime (event loop)
+Direct use is supported for advanced control:
+
 ```php
-$runtime = new Runtime();
-$task = $runtime->queue(fn() => $runtime->readAll($stream, 1024));
-$data = $task->await();
+use Krvh\MinimalPhpAsync\Runtime;
+
+$rt = new Runtime();
+$task = $rt->queue(static function () use ($rt): string {
+    $rt->delay(0.01);
+    return 'done';
+});
+$result = $task->await();
 ```
 
-`Runtime::write($stream, $data)` and `Runtime::readAll($stream, $maxBytes)`
-switch streams to non-blocking mode and suspend the Fiber until completion.
+Key behaviors:
+- `queue(Closure $fn): Task` starts a Fiber immediately and tracks parent-child
+  relationships for structured concurrency.
+- `drive(Closure $condition): void` runs the loop until the condition is true,
+  throwing `RuntimeException` on deadlock (no timers and no I/O).
+- `delay(float $seconds): void` suspends the current Fiber; negative values are
+  treated as `0.0` (yield on next tick).
+- `write(resource $stream, string $data): void` writes the full payload
+  asynchronously; switches stream to non-blocking and resumes on completion.
+- `readAll(resource $stream, int $maxBytes): string` reads until EOF with a
+  size guard; throws when the buffer exceeds `maxBytes`.
+- `cancelFiber(Fiber $fiber): void` best-effort cancellation that:
+  cancels child tasks, closes streams, removes timers, and throws
+  `RuntimeException("Task cancelled")` into the Fiber if possible.
 
-Key details:
-- `IO_CHUNK` is 8192 bytes.
-- `readAll()` reads until EOF and enforces a max byte limit.
-- On read/write failure, the runtime closes the stream and throws into the Fiber.
+### Task
+Represents a Fiber plus its lifecycle:
+- `await(): mixed` returns result or rethrows failure. From root it drives the
+  runtime; from another Fiber it suspends until completion.
+- `result(): mixed` returns the resolved value without driving; throws if the
+  task is not complete.
+- `cancel(): void` best-effort cancellation via the runtime.
+- `isDone(): bool`, `getFiber(): ?Fiber`, `getChildren(): array`.
+- Circular await is detected and throws `LogicException`.
 
-## HTTP Helper (Minimal RFC)
-`Async::fetch()` is a minimal HTTP/HTTPS helper built on the runtime I/O.
+### HttpException
+Thrown by `Async::fetch()` when HTTP status is >= 400.
+It exposes a readonly `status` property and sets the exception code to the
+status value.
 
+## HTTP Helper Specification
+`Async::fetch()` is intentionally minimal:
+- Connect is blocking (`stream_socket_client`) and then the stream is handed
+  to the runtime for non-blocking I/O.
+- Default headers: `Host`, `Connection: close`.
+- If `body` is non-empty and `Content-Length` is absent, it is added.
+- Responses must contain `\r\n\r\n` separating headers and body.
+- `Transfer-Encoding: chunked` responses are decoded.
+
+Options (`FetchOptions`) and defaults:
+- `method` (string, default `GET`)
+- `headers` (`array<string,string>`, default empty)
+- `body` (string, default empty)
+- `verify` (bool, default `true`) controls TLS peer verification
+- `connect_timeout` (float|int, default `30.0` seconds)
+- `max_bytes` (int, default `8_000_000`)
+
+Example:
 ```php
-$body = Async::fetch('https://example.test/', [
-    'method' => 'GET',
-    'headers' => ['User-Agent' => 'minimal-php-async'],
-    'body' => '',
+$body = Async::fetch('https://example.test/path', [
+    'method' => 'POST',
+    'headers' => ['Content-Type' => 'text/plain'],
+    'body' => 'payload',
+    'connect_timeout' => 1.5,
     'verify' => true,
-    'connect_timeout' => 5.0,
-    'max_bytes' => 1_000_000,
+    'max_bytes' => 100_000,
 ]);
 ```
 
-Semantics and limitations:
-- Connect uses `stream_socket_client()` in blocking mode (by design).
-- Once connected, the request/response uses non-blocking runtime I/O.
-- The request always sets `Connection: close` and reads until EOF.
-- If `body` is non-empty and `Content-Length` is not provided, it is added.
-- Response status >= 400 throws `HttpException` with the status code.
-- `Transfer-Encoding: chunked` is decoded; trailer headers are ignored.
-- `fetchJson()` adds `Accept: application/json` and decodes JSON into arrays
-  using `JSON_THROW_ON_ERROR` (default depth 512).
+Chunked decoding is strict:
+- Hex sizes with optional extensions are supported.
+- Each chunk must end with CRLF; trailers are allowed but must end with a
+  blank line and contain no extra bytes.
 
-This helper is intentionally small and not a full HTTP client.
+## Event Loop and Concurrency Model
+- Single-threaded, cooperative concurrency based on Fibers.
+- Fibers only yield via `delay()`, `write()`, or `readAll()`.
+- I/O readiness is polled via `stream_select`.
+- I/O chunk size is `8192` bytes (`Runtime::IO_CHUNK`).
+- Timers are scheduled via `microtime(true)` and the loop sleeps with `usleep`
+  when no I/O is pending.
+
+## Error Behavior Summary
+- `InvalidArgumentException` for invalid options, tasks, or streams.
+- `LogicException` for invalid usage (root `sleep`/`delay`, circular await,
+  awaiting uninitialized task, unresolved result mismatch).
+- `RuntimeException` for I/O errors, deadlocks, cancellation, timeouts, and
+  malformed HTTP chunk framing.
+- `HttpException` for HTTP status >= 400.
+- `JsonException` for invalid JSON in `fetchJson`.
+- `TypeError` for non-scalar header values in `buildRequest`.
+
+## Internal Types
+These are internal by design (enforced by `deptrac.yaml`):
+- `IoWatcher`: immutable readonly DTO for a pending I/O operation.
+  `offsetOrMaxBytes` is either write offset or read limit.
+- `Timer`: immutable readonly DTO for a wake-up timestamp and Fiber.
 
 ## Tooling and Quality Gates
-The project uses strict static analysis and testing in CI-style workflows:
+Composer scripts define the toolchain:
+- `composer test` runs PHPUnit.
+- `composer lint` runs `phpcs`, `phpmd`, `phpstan`, `psalm`, `phan`, `deptrac`.
+- `composer analyze` runs `phpstan`, `psalm`, `phan`.
+- `composer check` = lint + tests.
+- `composer ci` = check + mutation testing.
+- `composer deep-check` runs normalization, lint, coverage, infection, benches,
+  fuzz smoke, dependency checks, rector dry run, and BC check.
 
-| Tool | Purpose | Command |
-| --- | --- | --- |
-| PHPUnit | Unit tests | `composer test` |
-| PHP_CodeSniffer | Style | `composer phpcs` |
-| PHPMD | Code smell checks | `composer phpmd` |
-| PHPStan | Static analysis | `composer phpstan` |
-| Psalm | Static analysis | `composer psalm` |
-| Phan | Static analysis | `composer phan` |
-| Deptrac | Layer rules | `composer deptrac` |
-| Infection | Mutation testing | `composer infection` |
-| PHPBench | Benchmarks | `composer bench` |
-| php-fuzzer | Fuzzing | `composer fuzz:smoke` |
-| Composer Normalize | Composer.json normalization | `composer normalize` |
-| Composer Dependency Analyser | Dependency analysis | `composer dependency-analyser` |
-| Roave Backward Compatibility Check | API BC guard | `composer backward-compatibility` |
+Static analysis and style:
+- `phpcs` uses PSR-12 plus Slevomat rules, forbids `var_dump`, `print_r`,
+  `die`, `exit`, `dd`, `dump`, and enforces line length limits.
+- `phpmd` uses cleancode, codesize, design, naming (short/long vars allowed).
+- `phpstan` level 10 across `src/` and `tests/`.
+- `psalm` error level 1 with unused code detection and the PHPUnit plugin.
+- `phan` is configured for PHP 8.5, maximum strictness, and is executed from
+  `.phan/phan.phar`.
+- `rector` targets PHP 8.5 and includes quality/dead-code/type/privatization
+  sets with a dry-run script.
+- `deptrac` layers:
+  - Public: `Async`, `Runtime`, `Task`, `HttpException`
+  - Internal: `IoWatcher`, `Timer`
+  - Public may depend on Internal; Internal has no allowed dependencies.
 
-Additional convenience scripts:
-- `composer lint` runs style + static analysis + deptrac.
-- `composer check` runs `lint` and `test`.
-- `composer ci` runs `check` and `infection`.
-- `composer coverage` runs `scripts/coverage.php` (Xdebug/pcov if available).
-- `composer infection` runs `scripts/infection.php` (skips if no coverage driver).
-- `composer deep-check` runs an extended suite (composer normalize check, lint,
-  coverage, infection, benchmarks, fuzz, dependency checks, rector dry-run,
-  backward-compatibility).
+Mutation testing:
+- `infection.json5` sets `minMsi: 90` and `minCoveredMsi: 95`.
+- Logs: `infection.log`, `infection-summary.log`.
 
-Mutation testing thresholds are high by design (min MSI 90, covered MSI 95).
+## Testing Details
+- PHPUnit config: random order, fail on warnings/skips/notices, strict about
+  global state and output.
+- `tests/Support/` provides stream wrappers and overrides for deterministic
+  I/O (`stream_socket_client`, `stream_select`) and time (`microtime`, `usleep`).
+- Test timeouts use `pcntl_alarm` when `ext-pcntl` is available.
 
-## Compatibility
-- PHP >= 8.5 (uses Fibers, clone-with syntax, and strict typing).
-- No runtime dependencies; dev tooling is managed via Composer.
+## Fuzzing
+- Target: `fuzz/async-parse.php` exercises HTTP response parsing.
+- Dictionary: `fuzz/http.dict`.
+- Corpus: `fuzz/corpus/`.
+- `FUZZ_MAX_LEN` controls maximum input length.
+- `composer fuzz:smoke` runs a short fuzz session.
 
-## Extensibility Notes
-This codebase is intentionally small, so extensions should stay modest:
-- Add new async primitives as thin wrappers on `Runtime`.
-- Keep internal DTOs (`IoWatcher`, `Timer`) immutable.
-- Favor explicit cancellation semantics over implicit timeouts.
+## Benchmarks
+- phpbench config in `phpbench.json` runs microbenchmarks in `benchmarks/`.
+- `AsyncBench` measures core scheduling operations.
+- `HttpParsingBench` measures HTTP parsing and chunk decoding.
 
-## License
-MIT (see `composer.json`).
+## Backward Compatibility Check
+`scripts/backward-compatibility.php` runs `roave/backward-compatibility-check`.
+- Uses `BC_FROM`/`BC_TO` if set, otherwise the latest tag or `HEAD~1`.
+- Skips when no git history or tag is available.
+
+## Recorded Tooling Results (latest run)
+Executed `composer deep-check` and `composer coverage` on PHP 8.5.1 with Xdebug
+3.5.0:
+- PHPUnit: 238 tests, 1513 assertions.
+- Coverage: 100% classes, methods, paths, branches, and lines.
+- Infection: 483 mutations, MSI 100%, covered MSI 100%.
+- phpbench: completed without failures (values are machine-dependent).
+- Dependency analyzers: no unused packages or missing symbols.
+- Backward compatibility check: no breaking changes detected.
+
