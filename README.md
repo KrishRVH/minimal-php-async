@@ -162,6 +162,9 @@ The project uses strict static analysis and testing in CI-style workflows:
 | Infection | Mutation testing | `composer infection` |
 | PHPBench | Benchmarks | `composer bench` |
 | php-fuzzer | Fuzzing | `composer fuzz:smoke` |
+| Composer Normalize | Composer.json normalization | `composer normalize` |
+| Composer Dependency Analyser | Dependency analysis | `composer dependency-analyser` |
+| Roave Backward Compatibility Check | API BC guard | `composer backward-compatibility` |
 
 Additional convenience scripts:
 - `composer lint` runs style + static analysis + deptrac.
@@ -169,8 +172,9 @@ Additional convenience scripts:
 - `composer ci` runs `check` and `infection`.
 - `composer coverage` runs `scripts/coverage.php` (Xdebug/pcov if available).
 - `composer infection` runs `scripts/infection.php` (skips if no coverage driver).
-- `composer deep-check` runs an extended suite (lint, coverage, infection,
-  benchmarks, fuzz, dependency checks, rector dry-run).
+- `composer deep-check` runs an extended suite (composer normalize check, lint,
+  coverage, infection, benchmarks, fuzz, dependency checks, rector dry-run,
+  backward-compatibility).
 
 Mutation testing thresholds are high by design (min MSI 90, covered MSI 95).
 

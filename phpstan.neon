@@ -5,3 +5,7 @@ parameters:
 		- tests
 	ignoreErrors:
 		- '#generic class Fiber#'
+		- identifier: staticMethod.dynamicCall
+		  path: tests
+		- identifier: method.alreadyNarrowedType
+		  path: tests
