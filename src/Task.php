@@ -177,9 +177,14 @@ final class Task
      */
     public function cancel(): void
     {
-        if ($this->fiber instanceof Fiber && !$this->isDone()) {
-            $this->runtime->cancelFiber($this->fiber);
+        if (!$this->fiber instanceof Fiber) {
+            return;
         }
+        if ($this->isDone()) {
+            return;
+        }
+
+        $this->runtime->cancelFiber($this->fiber);
     }
 
     /**
@@ -198,7 +203,10 @@ final class Task
      */
     public function notifyWaiters(): void
     {
-        foreach ($this->waiters as $waiter) {
+        $waiters = $this->waiters;
+        $count = count($waiters);
+        for ($i = 0; $i < $count; $i++) {
+            $waiter = $waiters[$i];
             if (!$waiter->isTerminated()) {
                 $waiter->resume();
             }
@@ -216,14 +224,18 @@ final class Task
             throw new LogicException("Task result not available ({$type})");
         }
 
-        if (
-            $this->fiber instanceof Fiber
-            && $this->fiber->isTerminated()
-            && $this->fiber->getReturn() !== $value
-        ) {
-            $valueType = get_debug_type($value);
-            $returnType = get_debug_type($this->fiber->getReturn());
-            throw new LogicException("Task result mismatch ({$valueType} vs {$returnType})");
+        if (!$this->fiber instanceof Fiber) {
+            return;
         }
+        if (!$this->fiber->isTerminated()) {
+            return;
+        }
+        if ($this->fiber->getReturn() === $value) {
+            return;
+        }
+
+        $valueType = get_debug_type($value);
+        $returnType = get_debug_type($this->fiber->getReturn());
+        throw new LogicException("Task result mismatch ({$valueType} vs {$returnType})");
     }
 }

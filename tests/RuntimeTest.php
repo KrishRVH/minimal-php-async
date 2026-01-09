@@ -16,10 +16,13 @@ use Krvh\MinimalPhpAsync\IoWatcher;
 use Krvh\MinimalPhpAsync\Runtime;
 use Krvh\MinimalPhpAsync\Task;
 use Krvh\MinimalPhpAsync\Tests\Support\AsyncTestCase;
+use Krvh\MinimalPhpAsync\Tests\Support\EmptyReadStream;
 use Krvh\MinimalPhpAsync\Tests\Support\FailingReadStream;
+use Krvh\MinimalPhpAsync\Tests\Support\FixedWriteStream;
 use Krvh\MinimalPhpAsync\Tests\Support\SelectStub;
 use Krvh\MinimalPhpAsync\Tests\Support\SleepStub;
 use Krvh\MinimalPhpAsync\Tests\Support\TestHelper;
+use Krvh\MinimalPhpAsync\Tests\Support\ThrowingWriteStream;
 use Krvh\MinimalPhpAsync\Tests\Support\TimeStub;
 use Krvh\MinimalPhpAsync\Timer;
 use LogicException;
@@ -32,11 +35,184 @@ final class RuntimeTest extends AsyncTestCase
     public function testDriveThrowsOnDeadlock(): void
     {
         $runtime = new Runtime();
+        $state = new class {
+            public int $calls = 0;
+        };
 
         $this->expectException(RuntimeException::class);
-        TestHelper::withTimeout(1, static function () use ($runtime): void {
-            $runtime->drive(static fn(): bool => false);
+        $runtime->drive(static function () use ($state): bool {
+            $state->calls++;
+            if ($state->calls > 1) {
+                throw new LogicException('drive guard');
+            }
+            return false;
         });
+    }
+
+    public function testDriveReturnsImmediatelyWhenConditionTrue(): void
+    {
+        $runtime = new Runtime();
+
+        $runtime->drive(static fn(): bool => true);
+        $this->assertSame([], TestHelper::getProperty($runtime, 'read'));
+    }
+
+    public function testDriveContinuesWhenPendingWorkExists(): void
+    {
+        $runtime = new Runtime();
+        $fiber = TestHelper::newTerminatedFiber();
+        TestHelper::setProperty($runtime, 'timers', [new Timer(microtime(true) - 1.0, $fiber)]);
+
+        $state = new class {
+            public int $iterations = 0;
+        };
+        $runtime->drive(static function () use ($state): bool {
+            $state->iterations++;
+            return $state->iterations > 1;
+        });
+
+        $this->assertSame(2, $state->iterations);
+    }
+
+    public function testDriveContinuesWhenReadWatcherExists(): void
+    {
+        $runtime = new Runtime();
+        $stream = TestHelper::openTempStream();
+        $fiber = TestHelper::newSuspendedFiber();
+
+        TestHelper::setProperty($runtime, 'read', [
+            (int) $stream => new IoWatcher($stream, $fiber, '', 10),
+        ]);
+
+        SelectStub::forceResult(0);
+        $state = new class {
+            public int $calls = 0;
+        };
+        $runtime->drive(static function () use ($state): bool {
+            $state->calls++;
+            return $state->calls >= 2;
+        });
+
+        $this->assertSame(2, $state->calls);
+        TestHelper::setProperty($runtime, 'read', []);
+        TestHelper::closeResource($stream);
+    }
+
+    public function testDriveContinuesWhenWriteWatcherExists(): void
+    {
+        $runtime = new Runtime();
+        $stream = TestHelper::openTempStream();
+        $fiber = TestHelper::newSuspendedFiber();
+
+        TestHelper::setProperty($runtime, 'write', [
+            (int) $stream => new IoWatcher($stream, $fiber, 'data', 0),
+        ]);
+
+        SelectStub::forceResult(0);
+        $state = new class {
+            public int $calls = 0;
+        };
+        $runtime->drive(static function () use ($state): bool {
+            $state->calls++;
+            return $state->calls >= 2;
+        });
+
+        $this->assertSame(2, $state->calls);
+        TestHelper::setProperty($runtime, 'write', []);
+        TestHelper::closeResource($stream);
+    }
+
+    public function testDriveThrowsAfterWatchersCleared(): void
+    {
+        $runtime = new Runtime();
+        $stream = TestHelper::openTempStream();
+        fwrite($stream, 'ping');
+        rewind($stream);
+        $writeStream = TestHelper::openTempStream();
+        $writeFiber = TestHelper::newSuspendedFiber();
+        $state = new class {
+            public int $calls = 0;
+        };
+
+        $fiber = TestHelper::newSuspendedFiber();
+        TestHelper::setProperty($runtime, 'read', [
+            (int) $stream => new IoWatcher($stream, $fiber, '', 10),
+        ]);
+        TestHelper::setProperty($runtime, 'write', [
+            (int) $writeStream => new IoWatcher($writeStream, $writeFiber, 'pong', 0),
+        ]);
+
+        SelectStub::forceResult(2, [$stream], [$writeStream]);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Deadlock: no pending I/O or timers, but condition not met');
+
+        try {
+            $runtime->drive(static function () use ($state): bool {
+                $state->calls++;
+                if ($state->calls > 2) {
+                    throw new LogicException('drive guard');
+                }
+                return false;
+            });
+        } finally {
+            TestHelper::setProperty($runtime, 'read', []);
+            TestHelper::setProperty($runtime, 'write', []);
+            TestHelper::closeResource($stream);
+            TestHelper::closeResource($writeStream);
+        }
+    }
+
+    public function testAssertHasPendingWorkCoversCombinations(): void
+    {
+        $runtime = new Runtime();
+        $readStream = TestHelper::openTempStream();
+        $writeStream = TestHelper::openTempStream();
+        $fiber = TestHelper::newSuspendedFiber();
+
+        $readWatcher = new IoWatcher($readStream, $fiber, '', 10);
+        $writeWatcher = new IoWatcher($writeStream, $fiber, 'data', 0);
+        $timer = new Timer(microtime(true) + 1.0, $fiber);
+
+        $cases = [
+            ['read' => [], 'write' => [], 'timers' => [], 'throws' => true],
+            ['read' => [(int) $readStream => $readWatcher], 'write' => [], 'timers' => [], 'throws' => false],
+            ['read' => [], 'write' => [(int) $writeStream => $writeWatcher], 'timers' => [], 'throws' => false],
+            ['read' => [], 'write' => [], 'timers' => [$timer], 'throws' => false],
+            [
+                'read' => [(int) $readStream => $readWatcher],
+                'write' => [(int) $writeStream => $writeWatcher],
+                'timers' => [],
+                'throws' => false,
+            ],
+            ['read' => [(int) $readStream => $readWatcher], 'write' => [], 'timers' => [$timer], 'throws' => false],
+            ['read' => [], 'write' => [(int) $writeStream => $writeWatcher], 'timers' => [$timer], 'throws' => false],
+            [
+                'read' => [(int) $readStream => $readWatcher],
+                'write' => [(int) $writeStream => $writeWatcher],
+                'timers' => [$timer],
+                'throws' => false,
+            ],
+        ];
+
+        foreach ($cases as $case) {
+            TestHelper::setProperty($runtime, 'read', $case['read']);
+            TestHelper::setProperty($runtime, 'write', $case['write']);
+            TestHelper::setProperty($runtime, 'timers', $case['timers']);
+
+            try {
+                TestHelper::callPrivate($runtime, 'assertHasPendingWork');
+                $this->assertFalse($case['throws']);
+            } catch (RuntimeException) {
+                $this->assertTrue($case['throws']);
+            }
+        }
+
+        TestHelper::setProperty($runtime, 'read', []);
+        TestHelper::setProperty($runtime, 'write', []);
+        TestHelper::setProperty($runtime, 'timers', []);
+        fclose($readStream);
+        fclose($writeStream);
     }
 
     public function testQueueCapturesException(): void
@@ -50,6 +226,39 @@ final class RuntimeTest extends AsyncTestCase
         TestHelper::withTimeout(1, static function () use ($task): void {
             $task->await();
         });
+    }
+
+    public function testQueueNotifiesWaitersOnReject(): void
+    {
+        $runtime = new Runtime();
+        $state = new class {
+            public ?string $message = null;
+            public int $loops = 0;
+        };
+
+        $parent = $runtime->queue(static function () use ($runtime, $state): void {
+            $child = $runtime->queue(static function () use ($runtime): never {
+                $runtime->delay(0.0);
+                throw new RuntimeException('boom');
+            });
+
+            $state->message = 'missed';
+            try {
+                $child->await();
+            } catch (RuntimeException $e) {
+                $state->message = $e->getMessage();
+            }
+        });
+
+        $runtime->drive(static function () use ($state, $parent): bool {
+            $state->loops++;
+            if ($state->loops > 10) {
+                throw new LogicException('drive guard');
+            }
+            return $parent->isDone();
+        });
+        $actual = $state->message;
+        $this->assertSame('boom', $actual);
     }
 
     public function testQueueTracksChildTasks(): void
@@ -77,24 +286,25 @@ final class RuntimeTest extends AsyncTestCase
         $this->assertSame($child, $children[0]);
     }
 
-    public function testTaskForFiberReturnsTask(): void
+    public function testQueueSkipsUnknownParentFiber(): void
     {
         $runtime = new Runtime();
-        $task = $runtime->queue(static fn(): int => 1);
+        $state = new class {
+            /** @var Task<int>|null */
+            public ?Task $task = null;
+        };
 
-        $fiber = $task->getFiber();
-        $this->assertInstanceOf(Fiber::class, $fiber);
+        $fiber = new Fiber(static function () use ($runtime, $state): void {
+            $state->task = $runtime->queue(static fn(): int => 1);
+        });
+        $fiber->start();
 
-        $found = TestHelper::callPrivate($runtime, 'taskForFiber', [$fiber]);
-        $this->assertSame($task, $found);
-    }
+        $task = $state->task;
+        if (!$task instanceof Task) {
+            $this->fail('Expected task');
+        }
 
-    public function testTaskForFiberReturnsNullForUnknown(): void
-    {
-        $runtime = new Runtime();
-        $unknown = TestHelper::newSuspendedFiber();
-
-        $this->assertNull(TestHelper::callPrivate($runtime, 'taskForFiber', [$unknown]));
+        $this->assertSame([], $task->getChildren());
     }
 
     public function testRequireFiberThrowsFromRoot(): void
@@ -116,6 +326,52 @@ final class RuntimeTest extends AsyncTestCase
         $this->assertSame('ok', TestHelper::withTimeout(1, static fn(): mixed => $task->await()));
     }
 
+    public function testDelayAcceptsNegativeSeconds(): void
+    {
+        $runtime = new Runtime();
+        $task = $runtime->queue(static function () use ($runtime): string {
+            $runtime->delay(-0.01);
+            return 'ok';
+        });
+
+        $this->assertSame('ok', TestHelper::withTimeout(1, static fn(): mixed => $task->await()));
+    }
+
+    public function testDelayAcceptsPositiveSeconds(): void
+    {
+        $runtime = new Runtime();
+        $task = $runtime->queue(static function () use ($runtime): string {
+            $runtime->delay(0.01);
+            return 'ok';
+        });
+
+        $this->assertSame('ok', TestHelper::withTimeout(1, static fn(): mixed => $task->await()));
+    }
+
+    public function testDelayThrowsFromRoot(): void
+    {
+        $runtime = new Runtime();
+
+        $this->expectException(LogicException::class);
+        $runtime->delay(0.0);
+    }
+
+    public function testDelayThrowsFromRootWithPositiveSeconds(): void
+    {
+        $runtime = new Runtime();
+
+        $this->expectException(LogicException::class);
+        $runtime->delay(0.5);
+    }
+
+    public function testDelayThrowsFromRootWithNegativeSeconds(): void
+    {
+        $runtime = new Runtime();
+
+        $this->expectException(LogicException::class);
+        $runtime->delay(-0.5);
+    }
+
     public function testWriteEmptyIsNoop(): void
     {
         $runtime = new Runtime();
@@ -123,7 +379,15 @@ final class RuntimeTest extends AsyncTestCase
 
         $runtime->write($stream, '');
         $this->assertSame([], TestHelper::getProperty($runtime, 'write'));
-        fclose($stream);
+        TestHelper::closeResource($stream);
+    }
+
+    public function testWriteRejectsInvalidStream(): void
+    {
+        $runtime = new Runtime();
+
+        $this->expectException(InvalidArgumentException::class);
+        $runtime->write('not-a-stream', 'data');
     }
 
     public function testWriteSetsStreamNonBlocking(): void
@@ -216,6 +480,36 @@ final class RuntimeTest extends AsyncTestCase
         }
     }
 
+    public function testReadAllRejectsInvalidStream(): void
+    {
+        $runtime = new Runtime();
+
+        $this->expectException(InvalidArgumentException::class);
+        $runtime->readAll('not-a-stream', 10);
+    }
+
+    public function testReadAllThrowsOnNonStringResume(): void
+    {
+        $runtime = new Runtime();
+        $stream = TestHelper::openTempStream();
+
+        $fiber = new Fiber(static function () use ($runtime, $stream): void {
+            $runtime->readAll($stream, 10);
+        });
+        $fiber->start();
+
+        try {
+            /** @phan-suppress-next-line PhanParamTooManyInternal */
+            $fiber->resume(123);
+            $this->fail('Expected RuntimeException');
+        } catch (RuntimeException $e) {
+            $this->assertSame('Read failed: non-string payload', $e->getMessage());
+        } finally {
+            TestHelper::setProperty($runtime, 'read', []);
+            fclose($stream);
+        }
+    }
+
     public function testProcessWritesHandlesMissingWatcher(): void
     {
         $runtime = new Runtime();
@@ -223,6 +517,34 @@ final class RuntimeTest extends AsyncTestCase
 
         TestHelper::callPrivate($runtime, 'processWrites', [[$stream]]);
         $this->assertSame([], TestHelper::getProperty($runtime, 'write'));
+        fclose($stream);
+    }
+
+    public function testProcessWritesSkipsNonResourceStreams(): void
+    {
+        $runtime = new Runtime();
+
+        TestHelper::callPrivate($runtime, 'processWrites', [[null]]);
+        $this->assertSame([], TestHelper::getProperty($runtime, 'write'));
+    }
+
+    public function testProcessWritesHandlesNonListStreams(): void
+    {
+        $runtime = new Runtime();
+        $stream = TestHelper::openTempStream();
+
+        $fiber = TestHelper::newSuspendedFiber();
+        $watcher = new IoWatcher($stream, $fiber, 'ok', 0);
+
+        TestHelper::setProperty($runtime, 'write', [
+            (int) $stream => $watcher,
+        ]);
+
+        TestHelper::callPrivate($runtime, 'processWrites', [[5 => $stream]]);
+
+        $this->assertTrue($fiber->isTerminated());
+        $this->assertSame([], TestHelper::getProperty($runtime, 'write'));
+
         fclose($stream);
     }
 
@@ -293,13 +615,14 @@ final class RuntimeTest extends AsyncTestCase
         fclose($stream);
     }
 
-    public function testProcessWritesHandlesZeroProgress(): void
+    public function testProcessWritesHandlesWriteFailureAfterClamp(): void
     {
         $runtime = new Runtime();
-        $stream = TestHelper::openTempStream();
+        $stream = TestHelper::openTempStream('r');
 
         $fiber = TestHelper::newSuspendedFiber();
-        $watcher = new IoWatcher($stream, $fiber, '', 0);
+        $payload = str_repeat('a', 9000);
+        $watcher = new IoWatcher($stream, $fiber, $payload, 0);
 
         TestHelper::setProperty($runtime, 'write', [
             (int) $stream => $watcher,
@@ -307,42 +630,101 @@ final class RuntimeTest extends AsyncTestCase
 
         TestHelper::callPrivate($runtime, 'processWrites', [[$stream]]);
 
-        /** @var array<int, IoWatcher> $writeMap */
-        $writeMap = TestHelper::getProperty($runtime, 'write');
-        $this->assertArrayHasKey((int) $stream, $writeMap);
+        $this->assertSame([], TestHelper::getProperty($runtime, 'write'));
+        $this->assertTrue($fiber->isTerminated());
 
-        TestHelper::setProperty($runtime, 'write', []);
-        fclose($stream);
+        TestHelper::closeResource($stream);
+    }
+
+    public function testProcessWritesHandlesZeroProgress(): void
+    {
+        $runtime = new Runtime();
+        FixedWriteStream::register();
+
+        $stream = TestHelper::openStream(FixedWriteStream::uriFor(0), 'w');
+
+        try {
+            $fiber = TestHelper::newSuspendedFiber();
+            $watcher = new IoWatcher($stream, $fiber, 'data', 0);
+
+            TestHelper::setProperty($runtime, 'write', [
+                (int) $stream => $watcher,
+            ]);
+
+            TestHelper::callPrivate($runtime, 'processWrites', [[$stream]]);
+
+            /** @var array<int, IoWatcher> $writeMap */
+            $writeMap = TestHelper::getProperty($runtime, 'write');
+            $this->assertArrayHasKey((int) $stream, $writeMap);
+            $this->assertSame($watcher, $writeMap[(int) $stream]);
+        } finally {
+            TestHelper::setProperty($runtime, 'write', []);
+            TestHelper::closeResource($stream);
+            FixedWriteStream::unregister();
+        }
     }
 
     public function testProcessWritesContinuesAfterZeroProgress(): void
     {
         $runtime = new Runtime();
-        $stalled = TestHelper::openTempStream();
+        FixedWriteStream::register();
+
+        $stalled = TestHelper::openStream(FixedWriteStream::uriFor(0), 'w');
         $stream = TestHelper::openTempStream();
 
-        $stalledFiber = TestHelper::newSuspendedFiber();
-        $stalledWatcher = new IoWatcher($stalled, $stalledFiber, '', 0);
+        try {
+            $stalledFiber = TestHelper::newSuspendedFiber();
+            $stalledWatcher = new IoWatcher($stalled, $stalledFiber, 'data', 0);
 
-        $fiber = TestHelper::newSuspendedFiber();
-        $watcher = new IoWatcher($stream, $fiber, 'ok', 0);
+            $fiber = TestHelper::newSuspendedFiber();
+            $watcher = new IoWatcher($stream, $fiber, 'ok', 0);
 
-        TestHelper::setProperty($runtime, 'write', [
-            (int) $stalled => $stalledWatcher,
-            (int) $stream => $watcher,
-        ]);
+            TestHelper::setProperty($runtime, 'write', [
+                (int) $stalled => $stalledWatcher,
+                (int) $stream => $watcher,
+            ]);
 
-        TestHelper::callPrivate($runtime, 'processWrites', [[$stalled, $stream]]);
+            TestHelper::callPrivate($runtime, 'processWrites', [[$stalled, $stream]]);
 
-        /** @var array<int, IoWatcher> $writeMap */
-        $writeMap = TestHelper::getProperty($runtime, 'write');
-        $this->assertArrayHasKey((int) $stalled, $writeMap);
-        $this->assertArrayNotHasKey((int) $stream, $writeMap);
-        $this->assertTrue($fiber->isTerminated());
+            /** @var array<int, IoWatcher> $writeMap */
+            $writeMap = TestHelper::getProperty($runtime, 'write');
+            $this->assertArrayHasKey((int) $stalled, $writeMap);
+            $this->assertArrayNotHasKey((int) $stream, $writeMap);
+            $this->assertTrue($fiber->isTerminated());
+        } finally {
+            TestHelper::setProperty($runtime, 'write', []);
+            TestHelper::closeResource($stalled);
+            fclose($stream);
+            FixedWriteStream::unregister();
+        }
+    }
 
-        TestHelper::setProperty($runtime, 'write', []);
-        fclose($stalled);
-        fclose($stream);
+    public function testProcessWritesHandlesZeroProgressWithLargeBuffer(): void
+    {
+        $runtime = new Runtime();
+        FixedWriteStream::register();
+
+        $stream = TestHelper::openStream(FixedWriteStream::uriFor(0), 'w');
+
+        try {
+            $fiber = TestHelper::newSuspendedFiber();
+            $payload = str_repeat('a', 9000);
+            $watcher = new IoWatcher($stream, $fiber, $payload, 0);
+
+            TestHelper::setProperty($runtime, 'write', [
+                (int) $stream => $watcher,
+            ]);
+
+            TestHelper::callPrivate($runtime, 'processWrites', [[$stream]]);
+
+            /** @var array<int, IoWatcher> $writeMap */
+            $writeMap = TestHelper::getProperty($runtime, 'write');
+            $this->assertArrayHasKey((int) $stream, $writeMap);
+        } finally {
+            TestHelper::setProperty($runtime, 'write', []);
+            TestHelper::closeResource($stream);
+            FixedWriteStream::unregister();
+        }
     }
 
     public function testProcessWritesHandlesPartialAndComplete(): void
@@ -428,6 +810,101 @@ final class RuntimeTest extends AsyncTestCase
         fclose($stream);
     }
 
+    public function testProcessWriteStreamFailsWhenOffsetOutOfRange(): void
+    {
+        $runtime = new Runtime();
+        $stream = TestHelper::openTempStream();
+
+        $fiber = TestHelper::newSuspendedFiber();
+        $watcher = new IoWatcher($stream, $fiber, 'data', 10);
+        TestHelper::setProperty($runtime, 'write', [
+            (int) $stream => $watcher,
+        ]);
+
+        TestHelper::callPrivate($runtime, 'processWriteStream', [$stream]);
+
+        $this->assertSame([], TestHelper::getProperty($runtime, 'write'));
+        $this->assertTrue($fiber->isTerminated());
+
+        TestHelper::closeResource($stream);
+    }
+
+    public function testProcessWriteStreamFailsWhenOffsetEqualsLength(): void
+    {
+        $runtime = new Runtime();
+        $stream = TestHelper::openTempStream();
+
+        $fiber = TestHelper::newSuspendedFiber();
+        $watcher = new IoWatcher($stream, $fiber, 'data', 4);
+        TestHelper::setProperty($runtime, 'write', [
+            (int) $stream => $watcher,
+        ]);
+
+        TestHelper::callPrivate($runtime, 'processWriteStream', [$stream]);
+
+        $this->assertSame([], TestHelper::getProperty($runtime, 'write'));
+        $this->assertTrue($fiber->isTerminated());
+
+        TestHelper::closeResource($stream);
+    }
+
+    public function testSliceBufferHandlesZeroLength(): void
+    {
+        $runtime = new Runtime();
+
+        $chunk = TestHelper::callPrivate($runtime, 'sliceBuffer', ['data', 0, 0]);
+
+        $this->assertSame('', $chunk);
+    }
+
+    public function testSliceBufferHandlesOffsetBeyondBuffer(): void
+    {
+        $runtime = new Runtime();
+
+        $chunk = TestHelper::callPrivate($runtime, 'sliceBuffer', ['data', 10, 1]);
+
+        $this->assertSame('', $chunk);
+    }
+
+    public function testSliceBufferClampsLengthPastBuffer(): void
+    {
+        $runtime = new Runtime();
+
+        $chunk = TestHelper::callPrivate($runtime, 'sliceBuffer', ['data', 0, 10]);
+
+        $this->assertSame('data', $chunk);
+    }
+
+    public function testProcessWriteStreamThrowsOnStreamWriteException(): void
+    {
+        $runtime = new Runtime();
+        ThrowingWriteStream::register();
+
+        $stream = TestHelper::openStream(ThrowingWriteStream::uriFor('fail'), 'w');
+        $watcher = new IoWatcher($stream, TestHelper::newSuspendedFiber(), 'data', 0);
+        TestHelper::setProperty($runtime, 'write', [
+            (int) $stream => $watcher,
+        ]);
+
+        try {
+            $this->expectException(RuntimeException::class);
+            $this->expectExceptionMessage('stream_write failed');
+            TestHelper::callPrivate($runtime, 'processWriteStream', [$stream]);
+        } finally {
+            TestHelper::closeResource($stream);
+            ThrowingWriteStream::unregister();
+        }
+    }
+
+    public function testProcessWriteStreamSkipsNonResource(): void
+    {
+        $runtime = new Runtime();
+
+        TestHelper::callPrivate($runtime, 'processWriteStream', [null]);
+
+        $this->assertSame([], TestHelper::getProperty($runtime, 'write'));
+    }
+
     public function testProcessReadsHandlesMissingWatcher(): void
     {
         $runtime = new Runtime();
@@ -436,6 +913,87 @@ final class RuntimeTest extends AsyncTestCase
         TestHelper::callPrivate($runtime, 'processReads', [[$stream]]);
         $this->assertSame([], TestHelper::getProperty($runtime, 'read'));
         fclose($stream);
+    }
+
+    public function testProcessReadsHandlesNonListStreams(): void
+    {
+        $runtime = new Runtime();
+        $stream = TestHelper::openTempStream();
+        fwrite($stream, 'ping');
+        rewind($stream);
+
+        $state = new class {
+            public ?string $received = null;
+        };
+        $fiber = TestHelper::newSuspendedFiber(static function (mixed $value) use ($state): void {
+            $state->received = is_string($value) ? $value : null;
+        });
+
+        TestHelper::setProperty($runtime, 'read', [
+            (int) $stream => new IoWatcher($stream, $fiber, '', 10),
+        ]);
+
+        TestHelper::callPrivate($runtime, 'processReads', [[5 => $stream]]);
+
+        $this->assertSame('ping', $state->received);
+        $this->assertSame([], TestHelper::getProperty($runtime, 'read'));
+
+        TestHelper::closeResource($stream);
+    }
+
+    public function testProcessReadStreamSkipsNonResource(): void
+    {
+        $runtime = new Runtime();
+
+        TestHelper::callPrivate($runtime, 'processReadStream', [null]);
+
+        $this->assertSame([], TestHelper::getProperty($runtime, 'read'));
+    }
+
+    public function testProcessReadsHandlesEmptyStream(): void
+    {
+        $runtime = new Runtime();
+        $stream = TestHelper::openTempStream();
+
+        $state = new class {
+            public ?string $received = null;
+        };
+        $fiber = TestHelper::newSuspendedFiber(static function (mixed $value) use ($state): void {
+            $state->received = is_string($value) ? $value : null;
+        });
+
+        TestHelper::setProperty($runtime, 'read', [
+            (int) $stream => new IoWatcher($stream, $fiber, '', 10),
+        ]);
+
+        TestHelper::callPrivate($runtime, 'processReads', [[$stream]]);
+
+        $this->assertSame('', $state->received);
+    }
+
+    public function testProcessReadsHandlesEmptyChunkWithoutEof(): void
+    {
+        $runtime = new Runtime();
+        EmptyReadStream::register();
+
+        $stream = TestHelper::openStream('emptyread://stream', 'r');
+        $fiber = TestHelper::newSuspendedFiber();
+
+        TestHelper::setProperty($runtime, 'read', [
+            (int) $stream => new IoWatcher($stream, $fiber, 'seed', 10),
+        ]);
+
+        TestHelper::callPrivate($runtime, 'processReads', [[$stream]]);
+
+        /** @var array<int, IoWatcher> $readMap */
+        $readMap = TestHelper::getProperty($runtime, 'read');
+        $this->assertArrayHasKey((int) $stream, $readMap);
+        $this->assertSame('seed', $readMap[(int) $stream]->buffer);
+        $this->assertFalse($fiber->isTerminated());
+
+        TestHelper::setProperty($runtime, 'read', []);
+        TestHelper::closeResource($stream);
+        EmptyReadStream::unregister();
     }
 
     public function testProcessReadsContinuesAfterMissingWatcher(): void
@@ -842,6 +1400,24 @@ final class RuntimeTest extends AsyncTestCase
         TestHelper::closeResource($otherStream);
     }
 
+    public function testCleanupWatchersSkipsWhenNoMatch(): void
+    {
+        $runtime = new Runtime();
+        $targetFiber = TestHelper::newSuspendedFiber();
+        $otherFiber = TestHelper::newSuspendedFiber();
+
+        $stream = TestHelper::openTempStream();
+        $watchers = [
+            (int) $stream => new IoWatcher($stream, $otherFiber, '', 0),
+        ];
+
+        /** @var array<int, IoWatcher> $cleaned */
+        $cleaned = TestHelper::callPrivate($runtime, 'cleanupWatchers', [$watchers, $targetFiber]);
+        $this->assertArrayHasKey((int) $stream, $cleaned);
+
+        TestHelper::closeResource($stream);
+    }
+
     public function testCollectStreamsReturnsAllResources(): void
     {
         $runtime = new Runtime();
@@ -862,6 +1438,36 @@ final class RuntimeTest extends AsyncTestCase
 
         fclose($streamA);
         fclose($streamB);
+    }
+
+    public function testCollectStreamsSkipsClosedResources(): void
+    {
+        $runtime = new Runtime();
+        $streamA = TestHelper::openTempStream();
+        $streamB = TestHelper::openTempStream();
+        fclose($streamB);
+
+        $fiber = TestHelper::newSuspendedFiber();
+        $watchers = [
+            (int) $streamA => new IoWatcher($streamA, $fiber, '', 0),
+            (int) $streamB => new IoWatcher($streamB, $fiber, '', 0),
+        ];
+
+        /** @var list<resource> $streams */
+        $streams = TestHelper::callPrivate($runtime, 'collectStreams', [$watchers]);
+        $this->assertCount(1, $streams);
+        $this->assertSame($streamA, $streams[0]);
+
+        fclose($streamA);
+    }
+
+    public function testCollectStreamsHandlesEmptyWatchers(): void
+    {
+        $runtime = new Runtime();
+
+        /** @var list<resource> $streams */
+        $streams = TestHelper::callPrivate($runtime, 'collectStreams', [[]]);
+        $this->assertSame([], $streams);
     }
 
     public function testFailWatcherWithTerminatedFiber(): void
@@ -899,6 +1505,94 @@ final class RuntimeTest extends AsyncTestCase
         $this->assertIsFloat($next);
     }
 
+    public function testProcessTimersReturnsNearestFutureTimer(): void
+    {
+        $runtime = new Runtime();
+        $futureA = TestHelper::newSuspendedFiber();
+        $futureB = TestHelper::newSuspendedFiber();
+
+        $now = microtime(true);
+        TestHelper::setProperty($runtime, 'timers', [
+            new Timer($now + 5.0, $futureA),
+            new Timer($now + 1.0, $futureB),
+        ]);
+
+        $next = TestHelper::callPrivate($runtime, 'processTimers');
+        $this->assertIsFloat($next);
+        $this->assertLessThanOrEqual($now + 1.0, $next);
+    }
+
+    public function testProcessTimersHandlesTwoFutureTimers(): void
+    {
+        $runtime = new Runtime();
+        $futureA = TestHelper::newSuspendedFiber();
+        $futureB = TestHelper::newSuspendedFiber();
+        $now = 1000.0;
+
+        TimeStub::freeze($now);
+
+        TestHelper::setProperty($runtime, 'timers', [
+            new Timer($now + 2.0, $futureA),
+            new Timer($now + 1.0, $futureB),
+        ]);
+
+        $next = TestHelper::callPrivate($runtime, 'processTimers');
+        $this->assertSame($now + 1.0, $next);
+        /** @var array<int, Timer> $timers */
+        $timers = TestHelper::getProperty($runtime, 'timers');
+        $this->assertCount(2, $timers);
+    }
+
+    public function testProcessTimersHandlesThreeFutureTimers(): void
+    {
+        $runtime = new Runtime();
+        $futureA = TestHelper::newSuspendedFiber();
+        $futureB = TestHelper::newSuspendedFiber();
+        $futureC = TestHelper::newSuspendedFiber();
+        $now = 1000.0;
+
+        TimeStub::freeze($now);
+
+        TestHelper::setProperty($runtime, 'timers', [
+            new Timer($now + 3.0, $futureA),
+            new Timer($now + 2.0, $futureB),
+            new Timer($now + 1.0, $futureC),
+        ]);
+
+        $next = TestHelper::callPrivate($runtime, 'processTimers');
+        $this->assertSame($now + 1.0, $next);
+        /** @var array<int, Timer> $timers */
+        $timers = TestHelper::getProperty($runtime, 'timers');
+        $this->assertCount(3, $timers);
+    }
+
+    public function testProcessTimersHandlesSingleFutureTimer(): void
+    {
+        $runtime = new Runtime();
+        $future = TestHelper::newSuspendedFiber();
+        $now = 1000.0;
+
+        TimeStub::freeze($now);
+
+        TestHelper::setProperty($runtime, 'timers', [
+            new Timer($now + 5.0, $future),
+        ]);
+
+        $next = TestHelper::callPrivate($runtime, 'processTimers');
+        $this->assertSame($now + 5.0, $next);
+        /** @var array<int, Timer> $timers */
+        $timers = TestHelper::getProperty($runtime, 'timers');
+        $this->assertCount(1, $timers);
+    }
+
+    public function testProcessTimersReturnsNullWhenEmpty(): void
+    {
+        $runtime = new Runtime();
+
+        $next = TestHelper::callPrivate($runtime, 'processTimers');
+        $this->assertNull($next);
+    }
+
     public function testProcessTimersResumesTimersAtExactNow(): void
     {
         $runtime = new Runtime();
@@ -915,6 +1609,132 @@ final class RuntimeTest extends AsyncTestCase
 
         $this->assertTrue($fiber->isTerminated());
         $this->assertSame([], TestHelper::getProperty($runtime, 'timers'));
+    }
+
+    public function testProcessTimersHandlesDueThenFuture(): void
+    {
+        $runtime = new Runtime();
+        $due = TestHelper::newSuspendedFiber();
+        $future = TestHelper::newSuspendedFiber();
+        $now = 1000.0;
+
+        TimeStub::freeze($now);
+
+        TestHelper::setProperty($runtime, 'timers', [
+            new Timer($now - 1.0, $due),
+            new Timer($now + 1.0, $future),
+        ]);
+
+        $next = TestHelper::callPrivate($runtime, 'processTimers');
+
+        $this->assertTrue($due->isTerminated());
+        $this->assertSame($now + 1.0, $next);
+    }
+
+    public function testProcessTimersHandlesFutureBeforeDue(): void
+    {
+        $runtime = new Runtime();
+        $due = TestHelper::newSuspendedFiber();
+        $future = TestHelper::newSuspendedFiber();
+        $now = 1000.0;
+
+        TimeStub::freeze($now);
+
+        TestHelper::setProperty($runtime, 'timers', [
+            new Timer($now + 2.0, $future),
+            new Timer($now - 1.0, $due),
+        ]);
+
+        $next = TestHelper::callPrivate($runtime, 'processTimers');
+
+        $this->assertTrue($due->isTerminated());
+        $this->assertSame($now + 2.0, $next);
+    }
+
+    public function testProcessTimersHandlesMixedOrder(): void
+    {
+        $runtime = new Runtime();
+        $now = 1000.0;
+
+        TimeStub::freeze($now);
+
+        $dueA = TestHelper::newSuspendedFiber();
+        $dueB = TestHelper::newTerminatedFiber();
+        $dueC = TestHelper::newSuspendedFiber();
+
+        $futureA = TestHelper::newSuspendedFiber();
+        $futureB = TestHelper::newSuspendedFiber();
+        $futureC = TestHelper::newSuspendedFiber();
+        $futureD = TestHelper::newSuspendedFiber();
+        $futureE = TestHelper::newSuspendedFiber();
+        $futureF = TestHelper::newSuspendedFiber();
+
+        TestHelper::setProperty($runtime, 'timers', [
+            new Timer($now - 1.0, $dueA),
+            new Timer($now + 5.0, $futureA),
+            new Timer($now + 4.0, $futureB),
+            new Timer($now + 3.0, $futureC),
+            new Timer($now + 2.0, $futureD),
+            new Timer($now - 2.0, $dueB),
+            new Timer($now + 6.0, $futureE),
+            new Timer($now - 3.0, $dueC),
+            new Timer($now + 1.0, $futureF),
+        ]);
+
+        $next = TestHelper::callPrivate($runtime, 'processTimers');
+
+        $this->assertTrue($dueA->isTerminated());
+        $this->assertTrue($dueC->isTerminated());
+        $this->assertSame($now + 1.0, $next);
+    }
+
+    public function testProcessTimerKeepsNearestNext(): void
+    {
+        $runtime = new Runtime();
+        $fiber = TestHelper::newSuspendedFiber();
+        $now = 1000.0;
+
+        $timer = new Timer($now + 5.0, $fiber);
+
+        $this->assertSame(
+            $now + 5.0,
+            TestHelper::callPrivate($runtime, 'processTimer', [0, $timer, $now, null]),
+        );
+
+        $this->assertSame(
+            $now + 1.0,
+            TestHelper::callPrivate($runtime, 'processTimer', [0, $timer, $now, $now + 1.0]),
+        );
+
+        $this->assertSame(
+            $now + 5.0,
+            TestHelper::callPrivate($runtime, 'processTimer', [0, $timer, $now, $now + 5.0]),
+        );
+
+        $this->assertSame(
+            $now + 5.0,
+            TestHelper::callPrivate($runtime, 'processTimer', [0, $timer, $now, $now + 10.0]),
+        );
+    }
+
+    public function testRemoveTimersForFiberSkipsWhenNoMatch(): void
+    {
+        $runtime = new Runtime();
+        $target = TestHelper::newSuspendedFiber();
+        $other = TestHelper::newSuspendedFiber();
+
+        TestHelper::setProperty($runtime, 'timers', [
+            new Timer(microtime(true) + 1.0, $other),
+        ]);
+
+        TestHelper::callPrivate($runtime, 'removeTimersForFiber', [$target]);
+
+        /** @var array<int, Timer> $timers */
+        $timers = TestHelper::getProperty($runtime, 'timers');
+        $this->assertCount(1, $timers);
+        $key = array_key_first($timers);
+        $this->assertNotNull($key);
+        $this->assertSame($other, $timers[$key]->fiber);
     }
 
     public function testTickReturnsWhenNoIoOrTimers(): void
@@ -968,12 +1788,31 @@ final class RuntimeTest extends AsyncTestCase
         $this->assertCount(1, $timers);
     }
 
+    public function testTickSleepsWhenDurationPositive(): void
+    {
+        $runtime = new Runtime();
+        $future = TestHelper::newSuspendedFiber();
+
+        TimeStub::freeze(1000.0);
+        SleepStub::force();
+
+        TestHelper::setProperty($runtime, 'timers', [
+            new Timer(1000.1, $future),
+        ]);
+
+        TestHelper::callPrivate($runtime, 'tick');
+
+        $this->assertGreaterThan(0, SleepStub::callCount());
+    }
+
     public function testTickWaitsForIo(): void
     {
         $runtime = new Runtime();
         $stream = TestHelper::openTempStream();
         fwrite($stream, 'ping');
         rewind($stream);
+        $writeStream = TestHelper::openTempStream();
+        $writeFiber = TestHelper::newSuspendedFiber();
 
         $state = new class {
             public ?string $received = null;
@@ -985,9 +1824,68 @@ final class RuntimeTest extends AsyncTestCase
         TestHelper::setProperty($runtime, 'read', [
             (int) $stream => $watcher,
         ]);
+        TestHelper::setProperty($runtime, 'write', [
+            (int) $writeStream => new IoWatcher($writeStream, $writeFiber, 'pong', 0),
+        ]);
+        SelectStub::forceResult(2, [$stream], [$writeStream]);
 
         TestHelper::callPrivate($runtime, 'tick');
         $this->assertSame('ping', $state->received);
+        $this->assertTrue($writeFiber->isTerminated());
+        TestHelper::setProperty($runtime, 'read', []);
+        TestHelper::setProperty($runtime, 'write', []);
+        TestHelper::closeResource($stream);
+        TestHelper::closeResource($writeStream);
+    }
+
+    public function testTickSkipsSleepWhenReadWatcherPresent(): void
+    {
+        $runtime = new Runtime();
+        $stream = TestHelper::openTempStream();
+        $fiber = TestHelper::newSuspendedFiber();
+
+        TestHelper::setProperty($runtime, 'read', [
+            (int) $stream => new IoWatcher($stream, $fiber, '', 10),
+        ]);
+        TestHelper::setProperty($runtime, 'timers', [
+            new Timer(microtime(true) + 1.0, $fiber),
+        ]);
+
+        SleepStub::reset();
+        SleepStub::force();
+        SelectStub::forceResult(0);
+
+        TestHelper::callPrivate($runtime, 'tick');
+
+        $this->assertSame(0, SleepStub::callCount());
+        TestHelper::setProperty($runtime, 'read', []);
+        TestHelper::setProperty($runtime, 'timers', []);
+        fclose($stream);
+    }
+
+    public function testTickSkipsSleepWhenWriteWatcherPresent(): void
+    {
+        $runtime = new Runtime();
+        $stream = TestHelper::openTempStream();
+        $fiber = TestHelper::newSuspendedFiber();
+
+        TestHelper::setProperty($runtime, 'write', [
+            (int) $stream => new IoWatcher($stream, $fiber, 'data', 0),
+        ]);
+        TestHelper::setProperty($runtime, 'timers', [
+            new Timer(microtime(true) + 1.0, $fiber),
+        ]);
+
+        SleepStub::reset();
+        SleepStub::force();
+        SelectStub::forceResult(0);
+
+        TestHelper::callPrivate($runtime, 'tick');
+
+        $this->assertSame(0, SleepStub::callCount());
+        TestHelper::setProperty($runtime, 'write', []);
+        TestHelper::setProperty($runtime, 'timers', []);
+        fclose($stream);
     }
 
     public function testWaitForIoTimeoutAndReady(): void
@@ -996,6 +1894,8 @@ final class RuntimeTest extends AsyncTestCase
         $readyStream = TestHelper::openTempStream();
         fwrite($readyStream, 'ready');
         rewind($readyStream);
+        $writeStream = TestHelper::openTempStream();
+        $writeFiber = TestHelper::newSuspendedFiber();
 
         $state = new class {
             public ?string $received = null;
@@ -1007,10 +1907,16 @@ final class RuntimeTest extends AsyncTestCase
         TestHelper::setProperty($runtime, 'read', [
             (int) $readyStream => new IoWatcher($readyStream, $readFiber, '', 100),
         ]);
-        TestHelper::setProperty($runtime, 'write', []);
+        TestHelper::setProperty($runtime, 'write', [
+            (int) $writeStream => new IoWatcher($writeStream, $writeFiber, 'pong', 0),
+        ]);
 
+        SelectStub::forceResult(2, [$readyStream], [$writeStream]);
         TestHelper::callPrivate($runtime, 'waitForIo', [null]);
         $this->assertSame('ready', $state->received);
+        $this->assertTrue($writeFiber->isTerminated());
+        TestHelper::setProperty($runtime, 'write', []);
+        TestHelper::closeResource($writeStream);
 
         $timeoutStream = TestHelper::openTempStream();
         $timeoutFiber = TestHelper::newSuspendedFiber();
@@ -1023,6 +1929,25 @@ final class RuntimeTest extends AsyncTestCase
 
         TestHelper::setProperty($runtime, 'read', []);
         fclose($timeoutStream);
+    }
+
+    public function testWaitForIoReturnsWhenSelectFails(): void
+    {
+        $runtime = new Runtime();
+        $stream = TestHelper::openTempStream();
+        stream_set_blocking($stream, false);
+        $fiber = TestHelper::newSuspendedFiber();
+
+        TestHelper::setProperty($runtime, 'read', [
+            (int) $stream => new IoWatcher($stream, $fiber, '', 10),
+        ]);
+
+        SelectStub::forceResult(false);
+        TestHelper::callPrivate($runtime, 'waitForIo', [null]);
+
+        $this->assertFalse($fiber->isTerminated());
+        TestHelper::setProperty($runtime, 'read', []);
+        fclose($stream);
     }
 
     public function testSelectStreamsComputesShortTimeout(): void
@@ -1056,6 +1981,58 @@ final class RuntimeTest extends AsyncTestCase
         }
         $this->assertGreaterThanOrEqual(1, $timeout['seconds']);
         $this->assertLessThan(1_000_000, $timeout['microseconds']);
+    }
+
+    public function testSelectStreamsComputesWholeSecondTimeout(): void
+    {
+        SelectStub::forceResult(0);
+        TimeStub::freeze(1000.0);
+        $nextTimerAt = 1002.0;
+
+        $runtime = new Runtime();
+        TestHelper::callPrivate($runtime, 'selectStreams', [[], [], $nextTimerAt]);
+
+        $timeout = SelectStub::lastTimeout();
+        $this->assertSame(2, $timeout['seconds']);
+        $this->assertSame(0, $timeout['microseconds']);
+    }
+
+    public function testSelectStreamsWithoutTimerUsesNullTimeout(): void
+    {
+        SelectStub::forceResult(0);
+
+        $runtime = new Runtime();
+        TestHelper::callPrivate($runtime, 'selectStreams', [[], [], null]);
+
+        $timeout = SelectStub::lastTimeout();
+        $this->assertNull($timeout['seconds']);
+        $this->assertNull($timeout['microseconds']);
+    }
+
+    public function testSelectStreamsClampsPastTimeout(): void
+    {
+        SelectStub::forceResult(0);
+        TimeStub::freeze(1000.0);
+
+        $runtime = new Runtime();
+        TestHelper::callPrivate($runtime, 'selectStreams', [[], [], 999.0]);
+
+        $timeout = SelectStub::lastTimeout();
+        $this->assertSame(0, $timeout['seconds']);
+        $this->assertSame(0, $timeout['microseconds']);
+    }
+
+    public function testSelectStreamsComputesZeroTimeoutAtExactNow(): void
+    {
+        SelectStub::forceResult(0);
+        TimeStub::freeze(1000.0);
+
+        $runtime = new Runtime();
+        TestHelper::callPrivate($runtime, 'selectStreams', [[], [], 1000.0]);
+
+        $timeout = SelectStub::lastTimeout();
+        $this->assertSame(0, $timeout['seconds']);
+        $this->assertSame(0, $timeout['microseconds']);
     }
 
     public function testCancelFiberCleansUpWatchersAndTimers(): void
@@ -1103,6 +2080,8 @@ final class RuntimeTest extends AsyncTestCase
         $this->assertArrayHasKey((int) $readOther, $readMap);
         $this->assertArrayNotHasKey((int) $readTarget, $readMap);
         /** @psalm-suppress RedundantConditionGivenDocblockType */
+        $this->assertTrue(is_resource($readOther));
+        /** @psalm-suppress RedundantConditionGivenDocblockType */
         $this->assertFalse(is_resource($readTarget));
 
         /** @var array<int, IoWatcher> $writeMap */
@@ -1121,6 +2100,24 @@ final class RuntimeTest extends AsyncTestCase
         $runtime->cancelFiber($otherFiber);
     }
 
+    public function testCancelFiberHandlesParentWithoutChildren(): void
+    {
+        $runtime = new Runtime();
+        $fiber = TestHelper::newSuspendedFiber();
+
+        $parentTask = new Task($runtime);
+        $parentTask->setFiber($fiber);
+
+        $map = TestHelper::getProperty($runtime, 'fiberToTask');
+        if (!$map instanceof WeakMap) {
+            $this->fail('Expected WeakMap');
+        }
+        $map[$fiber] = $parentTask;
+
+        $runtime->cancelFiber($fiber);
+        $this->assertTrue($fiber->isTerminated());
+    }
+
     public function testCancelFiberReturnsEarlyForTerminatedFiber(): void
     {
         $runtime = new Runtime();
@@ -1128,5 +2125,59 @@ final class RuntimeTest extends AsyncTestCase
 
         $runtime->cancelFiber($fiber);
         $this->assertTrue($fiber->isTerminated());
+    }
+
+    public function testCancelFiberThrowsIntoHandledFiber(): void
+    {
+        $runtime = new Runtime();
+        $state = new class {
+            public string $message = '';
+        };
+
+        $fiber = new Fiber(static function () use ($state): void {
+            try {
+                Fiber::suspend();
+            } catch (RuntimeException $e) {
+                $state->message = $e->getMessage();
+            }
+        });
+        $fiber->start();
+
+        $runtime->cancelFiber($fiber);
+
+        /** @phan-suppress-next-line PhanPluginSuspiciousParamPosition */
+        $this->assertSame('Task cancelled', $state->message);
+    }
+
+    public function testCloseStreamNoopsWhenNotResource(): void
+    {
+        $runtime = new Runtime();
+
+        $result = TestHelper::callPrivate($runtime, 'closeStream', ['nope']);
+        $this->assertNull($result);
+    }
+
+    public function testIgnoreErrorAlwaysReturnsTrue(): void
+    {
+        $runtime = new Runtime();
+
+        $this->assertTrue(TestHelper::callPrivate($runtime, 'ignoreError', [E_WARNING, 'oops']));
+    }
+
+    public function testSuppressWarningsHandlesExceptions(): void
+    {
+        $runtime = new Runtime();
+
+        $result = TestHelper::callPrivate($runtime, 'suppressWarnings', [static fn(): int => 7]);
+        $this->assertSame(7, $result);
+
+        try {
+            TestHelper::callPrivate($runtime, 'suppressWarnings', [static function (): never {
+                throw new RuntimeException('boom');
+            }]);
+            $this->fail('Expected RuntimeException');
+        } catch (RuntimeException $e) {
+            $this->assertSame('boom', $e->getMessage());
+        }
     }
 }

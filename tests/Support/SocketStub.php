@@ -8,6 +8,8 @@ declare(strict_types=1);
 
 namespace Krvh\MinimalPhpAsync\Tests\Support;
 
+use Throwable;
+
 // phpcs:disable SlevomatCodingStandard.PHP.DisallowReference
 
 final class SocketStub
@@ -16,6 +18,7 @@ final class SocketStub
     private static ?string $nextResponse = null;
     private static bool $failNext = false;
     private static bool $silentFailNext = false;
+    private static ?Throwable $throwNext = null;
     private static ?string $lastAddress = null;
     /** @var array<array-key, mixed>|null */
     private static ?array $lastContextOptions = null;
@@ -26,6 +29,7 @@ final class SocketStub
         self::$nextResponse = null;
         self::$failNext = false;
         self::$silentFailNext = false;
+        self::$throwNext = null;
         self::$lastAddress = null;
         self::$lastContextOptions = null;
         FakeSocketStream::reset();
@@ -47,6 +51,14 @@ final class SocketStub
     public static function queueSilentFailure(): void
     {
         self::$silentFailNext = true;
+        self::$failNext = false;
+        self::$nextResponse = null;
+    }
+
+    public static function queueException(Throwable $exception): void
+    {
+        self::$throwNext = $exception;
+        self::$silentFailNext = false;
         self::$failNext = false;
         self::$nextResponse = null;
     }
@@ -91,6 +103,12 @@ final class SocketStub
     ): mixed {
         self::$lastAddress = $address;
         self::$lastContextOptions = is_resource($context) ? stream_context_get_options($context) : null;
+
+        if (self::$throwNext instanceof Throwable) {
+            $exception = self::$throwNext;
+            self::$throwNext = null;
+            throw $exception;
+        }
 
         if (self::$silentFailNext) {
             self::$silentFailNext = false;

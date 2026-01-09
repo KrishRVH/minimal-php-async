@@ -37,6 +37,7 @@ use WeakMap;
  *
  * @SuppressWarnings("PHPMD.ExcessiveClassComplexity")
  * @SuppressWarnings("PHPMD.StaticAccess")
+ * @SuppressWarnings("PHPMD.TooManyMethods")
  */
 final class Runtime
 {
@@ -73,9 +74,7 @@ final class Runtime
     public function drive(Closure $condition): void
     {
         while (!$condition()) {
-            if ($this->read === [] && $this->write === [] && $this->timers === []) {
-                throw new RuntimeException('Deadlock: no pending I/O or timers, but condition not met');
-            }
+            $this->assertHasPendingWork();
             $this->tick();
         }
     }
@@ -101,15 +100,14 @@ final class Runtime
                 // Return value is captured as Fiber return value.
                 $result = $fn();
                 $task->resolve($result);
+                $task->notifyWaiters();
                 return $result;
             } catch (Throwable $e) {
                 // Important: do NOT let the exception escape the Fiber start/resume call;
                 // store it and rethrow on await().
                 $task->reject($e);
-                return null;
-            } finally {
-                // Always resume awaiters.
                 $task->notifyWaiters();
+                return null;
             }
         });
 
@@ -119,7 +117,7 @@ final class Runtime
         // Parent-child tracking for structured concurrency.
         $parent = Fiber::getCurrent();
         if ($parent instanceof Fiber) {
-            $parentTask = $this->taskForFiber($parent);
+            $parentTask = $this->fiberToTask[$parent] ?? null;
             if ($parentTask instanceof Task) {
                 $parentTask->addChild($task);
             }
@@ -139,7 +137,10 @@ final class Runtime
      */
     public function delay(float $seconds): void
     {
-        $seconds = max(0.0, $seconds);
+        // @infection-ignore-all
+        if ($seconds < 0.0) {
+            $seconds = 0.0;
+        }
 
         $this->timers[] = new Timer(microtime(true) + $seconds, $this->requireFiber());
         Fiber::suspend();
@@ -226,69 +227,68 @@ final class Runtime
      */
     public function cancelFiber(Fiber $fiber): void
     {
-        $parentTask = $this->taskForFiber($fiber);
-        if ($parentTask instanceof Task) {
-            foreach ($parentTask->getChildren() as $child) {
-                $child->cancel();
-            }
-        }
+        $this->cancelChildren($fiber);
+        $this->read = $this->cleanupWatchers($this->read, $fiber);
+        $this->write = $this->cleanupWatchers($this->write, $fiber);
+        $this->removeTimersForFiber($fiber);
+        $this->throwCancellation($fiber);
+    }
 
-        $this->cleanupReadWatchers($fiber);
-        $this->cleanupWriteWatchers($fiber);
-
-        foreach ($this->timers as $k => $timer) {
-            if ($timer->fiber === $fiber) {
-                unset($this->timers[$k]);
-            }
-        }
-
-        if ($fiber->isTerminated()) {
-            // @infection-ignore-all
+    private function cancelChildren(Fiber $fiber): void
+    {
+        $parentTask = $this->fiberToTask[$fiber] ?? null;
+        if (!$parentTask instanceof Task) {
             return;
         }
 
-        try {
-            $fiber->throw(new RuntimeException('Task cancelled'));
-        } catch (Throwable) {
-            // Best-effort cancellation.
+        $children = $parentTask->getChildren();
+        array_walk(
+            $children,
+            static function (Task $child): void {
+                $child->cancel();
+            },
+        );
+    }
+
+    private function removeTimersForFiber(Fiber $fiber): void
+    {
+        $this->timers = array_filter(
+            $this->timers,
+            static fn(Timer $timer): bool => $timer->fiber !== $fiber,
+        );
+    }
+
+    private function assertHasPendingWork(): void
+    {
+        if (count($this->read) + count($this->write) + count($this->timers) === 0) {
+            throw new RuntimeException('Deadlock: no pending I/O or timers, but condition not met');
         }
-    }
-
-    /**
-     * @return Task<mixed>|null
-     */
-    private function taskForFiber(Fiber $fiber): ?Task
-    {
-        $task = $this->fiberToTask[$fiber] ?? null;
-        return $task instanceof Task ? $task : null;
-    }
-
-    private function cleanupReadWatchers(Fiber $fiber): void
-    {
-        $this->read = $this->cleanupWatchers($this->read, $fiber);
-    }
-
-    private function cleanupWriteWatchers(Fiber $fiber): void
-    {
-        $this->write = $this->cleanupWatchers($this->write, $fiber);
     }
 
     private function tick(): void
     {
         $nextTimerAt = $this->processTimers();
 
-        // If no I/O watchers, just sleep until the next timer (if any).
-        if ($this->read === [] && $this->write === []) {
-            if ($nextTimerAt !== null) {
-                $sleep = max(0.0, $nextTimerAt - microtime(true));
-                if ($sleep > 0) {
-                    usleep((int) ($sleep * 1_000_000.0));
-                }
-            }
+        if ($this->read !== []) {
+            $this->waitForIo($nextTimerAt);
+            return;
+        }
+        if ($this->write !== []) {
+            $this->waitForIo($nextTimerAt);
             return;
         }
 
-        $this->waitForIo($nextTimerAt);
+        // No I/O watchers: sleep until the next timer (if any).
+        if ($nextTimerAt === null) {
+            return;
+        }
+
+        $sleep = $nextTimerAt - microtime(true);
+        if ($sleep <= 0) {
+            return;
+        }
+
+        usleep((int) ($sleep * 1_000_000.0));
     }
 
     /**
@@ -298,23 +298,40 @@ final class Runtime
      */
     private function processTimers(): ?float
     {
-        $now = microtime(true);
-        $next = null;
-
-        foreach ($this->timers as $k => $timer) {
-            if ($timer->at <= $now) {
-                unset($this->timers[$k]);
-
-                if (!$timer->fiber->isTerminated()) {
-                    $timer->fiber->resume();
-                }
-                continue;
-            }
-
-            $next = $next === null ? $timer->at : min($next, $timer->at);
+        if ($this->timers === []) {
+            // @infection-ignore-all
+            return null;
         }
 
-        return $next;
+        $now = floatval(microtime(true));
+        $timers = $this->timers;
+        return array_reduce(
+            array_keys($timers),
+            fn(?float $next, int $key): ?float => $this->processTimer($key, $timers[$key], $now, $next),
+        );
+    }
+
+    private function processTimer(int $key, Timer $timer, float $now, ?float $next): ?float
+    {
+        if ($timer->at <= $now) {
+            unset($this->timers[$key]);
+
+            if (!$timer->fiber->isTerminated()) {
+                $timer->fiber->resume();
+            }
+            return $next;
+        }
+
+        if ($next === null) {
+            return $timer->at;
+        }
+
+        // @infection-ignore-all
+        if ($next <= $timer->at) {
+            return $next;
+        }
+
+        return $timer->at;
     }
 
     private function waitForIo(?float $nextTimerAt): void
@@ -327,7 +344,10 @@ final class Runtime
             $writeStreams,
             $nextTimerAt,
         );
-        if ($ready === false || $ready === 0) {
+        if ($ready === false) {
+            return;
+        }
+        if ($ready === 0) {
             return;
         }
 
@@ -338,78 +358,106 @@ final class Runtime
     /** @param array<array-key, resource> $streams */
     private function processWrites(array $streams): void
     {
-        foreach ($streams as $stream) {
-            $id = (int) $stream;
-            $watcher = $this->write[$id] ?? null;
-            if ($watcher === null) {
-                continue;
-            }
+        $values = array_values($streams);
+        $count = count($values);
+        for ($i = 0; $i < $count; $i++) {
+            $this->processWriteStream($values[$i]);
+        }
+    }
 
-            $offset = $watcher->offsetOrMaxBytes;
-            $len = strlen($watcher->buffer);
+    /**
+     * @param resource|null $stream
+     */
+    private function processWriteStream(mixed $stream): void
+    {
+        if (!is_resource($stream)) {
+            return;
+        }
+        $id = (int) $stream;
+        $watcher = $this->write[$id] ?? null;
+        if ($watcher === null) {
+            return;
+        }
 
-            $chunk = substr($watcher->buffer, $offset, self::IO_CHUNK);
-            $written = $this->suppressWarnings(static fn(): int|false => fwrite($stream, $chunk));
+        $offset = $watcher->offsetOrMaxBytes;
+        $len = strlen($watcher->buffer);
+        if ($offset >= $len) {
+            $this->failWrite($id, 'Write failed');
+            return;
+        }
 
-            if ($written === false) {
-                $this->failWrite($id, 'Write failed');
-                continue;
-            }
-
+        $chunk = $this->sliceBuffer($watcher->buffer, $offset, self::IO_CHUNK);
+        $written = $this->suppressWarnings(static fn(): int|false => fwrite($stream, $chunk));
+        if ($written === false) {
+            $this->failWrite($id, 'Write failed');
+            return;
+        }
+        if ($written === 0) {
             // No progress; keep watcher and try again on a future tick.
-            if ($written === 0) {
-                continue;
-            }
+            return;
+        }
 
-            $newOffset = $offset + $written;
+        $newOffset = $offset + $written;
 
-            if ($newOffset < $len) {
-                $this->write[$id] = $watcher->with($watcher->buffer, $newOffset);
-                continue;
-            }
+        if ($newOffset < $len) {
+            $this->write[$id] = $watcher->with($watcher->buffer, $newOffset);
+            return;
+        }
 
-            unset($this->write[$id]);
-            if (!$watcher->fiber->isTerminated()) {
-                $watcher->fiber->resume();
-            }
+        unset($this->write[$id]);
+        if (!$watcher->fiber->isTerminated()) {
+            $watcher->fiber->resume();
         }
     }
 
     /** @param array<array-key, resource> $streams */
     private function processReads(array $streams): void
     {
-        foreach ($streams as $stream) {
-            $id = (int) $stream;
-            $watcher = $this->read[$id] ?? null;
-            if ($watcher === null) {
-                continue;
-            }
-
-            $chunk = $this->suppressWarnings(static fn(): string|false => fread($stream, self::IO_CHUNK));
-            if ($chunk === false) {
-                $this->failRead($id, 'Read failed');
-                continue;
-            }
-
-            $buffer = $watcher->buffer . $chunk;
-
-            if (strlen($buffer) > $watcher->offsetOrMaxBytes) {
-                $this->failRead($id, 'Response too large');
-                continue;
-            }
-
-            if (feof($stream)) {
-                unset($this->read[$id]);
-                $this->closeStream($stream);
-
-                if (!$watcher->fiber->isTerminated()) {
-                    $watcher->fiber->resume($buffer);
-                }
-                continue;
-            }
-
-            $this->read[$id] = $watcher->with($buffer, $watcher->offsetOrMaxBytes);
+        $values = array_values($streams);
+        $count = count($values);
+        for ($i = 0; $i < $count; $i++) {
+            $this->processReadStream($values[$i]);
         }
+    }
+
+    /**
+     * @param resource|null $stream
+     */
+    private function processReadStream(mixed $stream): void
+    {
+        if (!is_resource($stream)) {
+            return;
+        }
+        $id = (int) $stream;
+        $watcher = $this->read[$id] ?? null;
+        if ($watcher === null) {
+            return;
+        }
+
+        $chunk = $this->suppressWarnings(static fn(): string|false => fread($stream, self::IO_CHUNK));
+        if ($chunk === false) {
+            $this->failRead($id, 'Read failed');
+            return;
+        }
+
+        $buffer = $watcher->buffer . $chunk;
+
+        if (strlen($buffer) > $watcher->offsetOrMaxBytes) {
+            $this->failRead($id, 'Response too large');
+            return;
+        }
+
+        if (feof($stream)) {
+            unset($this->read[$id]);
+            $this->closeStream($stream);
+
+            if (!$watcher->fiber->isTerminated()) {
+                $watcher->fiber->resume($buffer);
+            }
+            return;
+        }
+
+        $this->read[$id] = $watcher->with($buffer, $watcher->offsetOrMaxBytes);
     }
 
     /**
@@ -446,17 +494,19 @@ final class Runtime
      */
     private function cleanupWatchers(array $watchers, Fiber $fiber): array
     {
-        foreach ($watchers as $id => $w) {
-            if ($w->fiber !== $fiber) {
-                continue;
-            }
+        $toClose = array_filter(
+            $watchers,
+            static fn(IoWatcher $watcher): bool => $watcher->fiber === $fiber,
+        );
 
-            $this->closeStream($w->stream);
+        array_walk($toClose, function (IoWatcher $watcher): void {
+            $this->closeStream($watcher->stream);
+        });
 
-            unset($watchers[$id]);
-        }
-
-        return $watchers;
+        return array_filter(
+            $watchers,
+            static fn(IoWatcher $watcher): bool => $watcher->fiber !== $fiber,
+        );
     }
 
     /**
@@ -466,13 +516,14 @@ final class Runtime
      */
     private function collectStreams(array $watchers): array
     {
-        $streams = [];
-        foreach ($watchers as $watcher) {
-            if (is_resource($watcher->stream)) {
-                $streams[] = $watcher->stream;
-            }
-        }
+        $streams = array_map(
+            static fn(IoWatcher $watcher): mixed => $watcher->stream,
+            $watchers,
+        );
+        $streams = array_filter($streams, is_resource(...));
+        $streams = array_values($streams);
 
+        /** @var list<resource> $streams */
         return $streams;
     }
 
@@ -501,11 +552,14 @@ final class Runtime
     {
         $except = [];
 
-        $timeout = $nextTimerAt === null ? null : max(0.0, $nextTimerAt - microtime(true));
-
         $sec = null;
         $usec = null;
-        if ($timeout !== null) {
+        if ($nextTimerAt !== null) {
+            $timeout = $nextTimerAt - microtime(true);
+            // @infection-ignore-all
+            if ($timeout < 0.0) {
+                $timeout = 0.0;
+            }
             $sec = (int) $timeout;
             $usec = (int) (($timeout - (float) $sec) * 1_000_000.0);
         }
@@ -544,10 +598,14 @@ final class Runtime
         set_error_handler($this->ignoreError(...));
 
         try {
-            return $fn();
-        } finally {
+            $result = $fn();
+        } catch (Throwable $e) {
             restore_error_handler();
+            throw $e;
         }
+
+        restore_error_handler();
+        return $result;
     }
 
     /**
@@ -559,5 +617,42 @@ final class Runtime
     private function ignoreError(int $errno, string $errstr): bool
     {
         return true;
+    }
+
+    /**
+     * @phan-suppress PhanPluginPossiblyStaticPrivateMethod
+     */
+    private function throwCancellation(Fiber $fiber): void
+    {
+        if ($fiber->isTerminated()) {
+            // @infection-ignore-all
+            return;
+        }
+
+        try {
+            $fiber->throw(new RuntimeException('Task cancelled'));
+        } catch (Throwable) {
+            // Best-effort cancellation.
+        }
+    }
+
+    /**
+     * @phan-suppress PhanPluginPossiblyStaticPrivateMethod
+     */
+    private function sliceBuffer(string $buffer, int $offset, int $length): string
+    {
+        $bufferLen = strlen($buffer);
+        $end = $offset + $length;
+        // @infection-ignore-all
+        if ($end > $bufferLen) {
+            $end = $bufferLen;
+        }
+
+        $chunk = '';
+        for ($i = $offset; $i < $end; $i++) {
+            $chunk .= $buffer[$i];
+        }
+
+        return $chunk;
     }
 }

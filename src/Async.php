@@ -14,6 +14,8 @@ namespace Krvh\MinimalPhpAsync;
 use Closure;
 use InvalidArgumentException;
 use RuntimeException;
+use Throwable;
+use TypeError;
 
 /**
  * Static facade for the fiber runtime.
@@ -57,6 +59,10 @@ final class Async
      * Temporarily swap the global runtime instance for the duration of $fn.
      *
      * Useful for tests or isolating multiple runtimes in the same process.
+     *
+     * @template T
+     * @param Closure():T $fn
+     * @return T
      */
     public static function withRuntime(Runtime $runtime, Closure $fn): mixed
     {
@@ -64,10 +70,14 @@ final class Async
         self::$instance = $runtime;
 
         try {
-            return $fn();
-        } finally {
+            $result = $fn();
+        } catch (Throwable $e) {
             self::$instance = $prev;
+            throw $e;
         }
+
+        self::$instance = $prev;
+        return $result;
     }
 
     /**
@@ -108,8 +118,9 @@ final class Async
      * Await all tasks and return results preserving input keys.
      *
      * @template TKey of array-key
-     * @param array<TKey, (Task<mixed>|Closure)> $tasks
-     * @return array<TKey, mixed>
+     * @template T
+     * @param array<TKey, (Task<T>|Closure():T)> $tasks
+     * @return array<TKey, T>
      */
     public static function all(array $tasks): array
     {
@@ -118,20 +129,21 @@ final class Async
 
         $rt->drive(static fn(): bool => self::allDone($handles));
 
-        /** @var array<TKey, mixed> $results */
-        $results = [];
-        foreach ($handles as $k => $task) {
-            /** @psalm-suppress MixedAssignment */
-            $results[$k] = $task->result();
-        }
+        $results = array_map(
+            static fn(Task $task): mixed => $task->result(),
+            $handles,
+        );
 
+        /** @var array<TKey, T> $results */
         return $results;
     }
 
     /**
      * Await the first task to complete, cancel the rest, and return its result.
      *
-     * @param array<array-key, (Task<mixed>|Closure)> $tasks
+     * @template T
+     * @param array<array-key, (Task<T>|Closure():T)> $tasks
+     * @return T
      */
     public static function race(array $tasks): mixed
     {
@@ -142,19 +154,11 @@ final class Async
         if ($handles === []) {
             throw new InvalidArgumentException('race() requires at least one task');
         }
-
         $rt->drive(static fn(): bool => self::anyDone($handles));
 
         $winner = self::firstDone($handles);
-        if (!$winner instanceof Task) {
-            throw new RuntimeException('race() did not produce a winner');
-        }
 
-        foreach ($handles as $t) {
-            if ($t !== $winner) {
-                $t->cancel();
-            }
-        }
+        self::cancelLosers($handles, $winner);
 
         return $winner->await();
     }
@@ -164,6 +168,10 @@ final class Async
      *
      * Implementation detail:
      * - This is implemented as a {@see Async::race()} between work and a timer task.
+     *
+     * @template T
+     * @param Closure():T $fn
+     * @return T
      */
     public static function timeout(Closure $fn, float $sec): mixed
     {
@@ -237,28 +245,26 @@ final class Async
 
     /**
      * @template TKey of array-key
-     * @param array<TKey, (Task<mixed>|Closure)> $tasks
-     * @return array<TKey, Task<mixed>>
+     * @template T
+     * @param array<TKey, (Task<T>|Closure():T)> $tasks
+     * @phpstan-param array<TKey, (Task<T>|Closure():T|int|string)> $tasks
+     * @return array<TKey, Task<T>>
      */
     private static function normalizeTasks(array $tasks, Runtime $rt): array
     {
-        $handles = [];
+        return array_map(
+            static function (mixed $task) use ($rt): Task {
+                if ($task instanceof Task) {
+                    return $task;
+                }
+                if ($task instanceof Closure) {
+                    return $rt->queue($task);
+                }
 
-        foreach ($tasks as $k => $t) {
-            if ($t instanceof Task) {
-                $handles[$k] = $t;
-                continue;
-            }
-
-            // @phpstan-ignore-next-line
-            if (!$t instanceof Closure) {
                 throw new InvalidArgumentException('Invalid task');
-            }
-
-            $handles[$k] = $rt->queue(static fn(): mixed => $t());
-        }
-
-        return $handles;
+            },
+            $tasks,
+        );
     }
 
     /**
@@ -278,18 +284,35 @@ final class Async
     }
 
     /**
-     * @param array<array-key, Task<mixed>> $tasks
-     * @return Task<mixed>|null
+     * @template T
+     * @param array<array-key, Task<T>> $tasks
+     * @return Task<T>
      */
-    private static function firstDone(array $tasks): ?Task
+    private static function firstDone(array $tasks): Task
     {
-        foreach ($tasks as $task) {
-            if ($task->isDone()) {
-                return $task;
-            }
+        /** @var Task<T>|null $winner */
+        $winner = array_find($tasks, static fn(Task $task): bool => $task->isDone());
+        if ($winner instanceof Task) {
+            return $winner;
         }
 
-        return null;
+        throw new RuntimeException('race() failed to resolve a winner');
+    }
+
+    /**
+     * @param array<array-key, Task<mixed>> $tasks
+     * @param Task<mixed> $winner
+     */
+    private static function cancelLosers(array $tasks, Task $winner): void
+    {
+        array_walk(
+            $tasks,
+            static function (Task $task) use ($winner): void {
+                if ($task !== $winner) {
+                    $task->cancel();
+                }
+            },
+        );
     }
 
     /**
@@ -322,7 +345,10 @@ final class Async
      */
     private static function requireNonEmptyString(string|null $value, string $message): string
     {
-        if (!is_string($value) || $value === '') {
+        if (!is_string($value)) {
+            throw new InvalidArgumentException($message);
+        }
+        if ($value === '') {
             throw new InvalidArgumentException($message);
         }
 
@@ -334,16 +360,22 @@ final class Async
      */
     private static function normalizeScheme(string $scheme, string $url): string
     {
-        if ($scheme !== 'http' && $scheme !== 'https') {
-            throw new InvalidArgumentException("Unsupported scheme '{$scheme}' for URL: {$url}");
+        if ($scheme === 'http') {
+            return $scheme;
+        }
+        if ($scheme === 'https') {
+            return $scheme;
         }
 
-        return $scheme;
+        throw new InvalidArgumentException("Unsupported scheme '{$scheme}' for URL: {$url}");
     }
 
     private static function normalizePort(int $port, string $url): int
     {
-        if ($port <= 0 || $port > 65535) {
+        if ($port <= 0) {
+            throw new InvalidArgumentException("Invalid port for URL: {$url}");
+        }
+        if ($port > 65535) {
             throw new InvalidArgumentException("Invalid port for URL: {$url}");
         }
 
@@ -369,7 +401,10 @@ final class Async
      */
     private static function appendQuery(string $path, string|null $query): string
     {
-        if (!is_string($query) || $query === '') {
+        if ($query === null) {
+            return $path;
+        }
+        if ($query === '') {
             return $path;
         }
 
@@ -382,7 +417,10 @@ final class Async
     private static function resolveMethod(array $opts): string
     {
         $method = $opts['method'] ?? 'GET';
-        if (!is_string($method) || $method === '') {
+        if (!is_string($method)) {
+            throw new InvalidArgumentException('opts["method"] must be a non-empty string');
+        }
+        if ($method === '') {
             throw new InvalidArgumentException('opts["method"] must be a non-empty string');
         }
 
@@ -394,7 +432,10 @@ final class Async
      */
     private static function resolveBody(array $opts): string
     {
-        if (!array_key_exists('body', $opts) || $opts['body'] === null) {
+        if (!array_key_exists('body', $opts)) {
+            return '';
+        }
+        if ($opts['body'] === null) {
             return '';
         }
 
@@ -419,15 +460,23 @@ final class Async
             throw new InvalidArgumentException('opts["headers"] must be an array of string pairs');
         }
 
-        $normalized = [];
-        foreach ($headers as $name => $value) {
-            if (!is_string($name) || $name === '' || !is_string($value)) {
-                throw new InvalidArgumentException('opts["headers"] must be an array of string pairs');
-            }
-            $normalized[$name] = $value;
-        }
+        array_walk(
+            $headers,
+            static function (mixed $value, mixed $name): void {
+                if (!is_string($name)) {
+                    throw new InvalidArgumentException('opts["headers"] must be an array of string pairs');
+                }
+                if ($name === '') {
+                    throw new InvalidArgumentException('opts["headers"] must be an array of string pairs');
+                }
+                if (!is_string($value)) {
+                    throw new InvalidArgumentException('opts["headers"] must be an array of string pairs');
+                }
+            },
+        );
 
-        return $normalized;
+        /** @var array<string, string> $headers */
+        return $headers;
     }
 
     /**
@@ -435,15 +484,28 @@ final class Async
      */
     private static function resolveConnectTimeout(array $opts): float
     {
-        $timeout = $opts['connect_timeout'] ?? 30.0;
-        if (!is_int($timeout) && !is_float($timeout)) {
-            throw new InvalidArgumentException('opts["connect_timeout"] must be a number');
+        /** @psalm-suppress MixedAssignment */
+        $timeout = $opts['connect_timeout'] ?? null;
+        if ($timeout === null) {
+            return 30.0;
         }
-        if ($timeout < 0) {
-            throw new InvalidArgumentException('opts["connect_timeout"] must be >= 0');
+        if (is_int($timeout)) {
+            if ($timeout < 0) {
+                throw new InvalidArgumentException('opts["connect_timeout"] must be >= 0');
+            }
+
+            return $timeout;
         }
 
-        return (float) $timeout;
+        if (is_float($timeout)) {
+            if ($timeout < 0) {
+                throw new InvalidArgumentException('opts["connect_timeout"] must be >= 0');
+            }
+
+            return $timeout;
+        }
+
+        throw new InvalidArgumentException('opts["connect_timeout"] must be a number');
     }
 
     /**
@@ -492,15 +554,28 @@ final class Async
     }
 
     /**
-     * @param array<string, string> $headers
+     * @param array<array-key, mixed> $headers
      */
     private static function buildRequest(string $method, string $path, array $headers, string $body): string
     {
         $req = "{$method} {$path} HTTP/1.1\r\n";
-        foreach ($headers as $k => $v) {
-            $req .= "{$k}: {$v}\r\n";
+        $keys = array_keys($headers);
+        $values = array_values($headers);
+        $count = count($headers);
+        $headerBlock = '';
+        for ($i = 0; $i < $count; $i++) {
+            $value = $values[$i];
+            if (!is_scalar($value)) {
+                throw new TypeError('Header values must be scalar');
+            }
+            if (is_bool($value)) {
+                $value = (int) $value;
+            }
+            $value = sprintf('%s', $value);
+            $headerBlock .= $keys[$i] . ': ' . $value . "\r\n";
         }
-        return $req . "\r\n{$body}";
+
+        return $req . $headerBlock . "\r\n{$body}";
     }
 
     /**
@@ -547,9 +622,11 @@ final class Async
         // @infection-ignore-all
         try {
             $stream = stream_socket_client($addr, $errno, $errstr, $timeout, STREAM_CLIENT_CONNECT, $ctx);
-        } finally {
+        } catch (Throwable $e) {
             restore_error_handler();
+            throw $e;
         }
+        restore_error_handler();
         if (!is_resource($stream)) {
             $message = $errstr !== '' ? $errstr : 'Unknown error';
             throw new RuntimeException("Connect failed: {$message}", $errno);
@@ -577,27 +654,46 @@ final class Async
      */
     private static function parseResponse(string $raw, string $originalUrl): string
     {
-        $pos = strpos($raw, "\r\n\r\n");
-        if ($pos === false) {
+        ['head' => $head, 'body' => $body] = self::splitResponse($raw);
+
+        self::throwIfHttpError($head, $originalUrl);
+
+        return self::isChunked($head) ? self::decodeChunked($body) : $body;
+    }
+
+    /**
+     * @return array{head: string, body: string}
+     */
+    private static function splitResponse(string $raw): array
+    {
+        $parts = explode("\r\n\r\n", $raw, 2);
+        if (!isset($parts[1])) {
             throw new RuntimeException('Malformed HTTP response (missing header/body separator)');
         }
 
-        $head = substr($raw, 0, $pos);
-        $body = substr($raw, $pos + 4);
+        return [
+            'head' => $parts[0],
+            'body' => $parts[1],
+        ];
+    }
 
-        if (preg_match('/^HTTP\/1\.[01]\s+(\d{3})/i', $head, $m) === 1) {
-            $status = (int) $m[1];
-            if ($status >= 400) {
-                throw new HttpException($status, $originalUrl);
-            }
+    private static function throwIfHttpError(string $head, string $originalUrl): void
+    {
+        if (preg_match('/^HTTP\/1\.[01]\s+(\d{3})/i', $head, $m) !== 1) {
+            return;
         }
 
-        // Cheap, case-insensitive header check.
-        if (stripos($head, "Transfer-Encoding: chunked") !== false) {
-            return self::decodeChunked($body);
+        $status = (int) $m[1];
+        if ($status < 400) {
+            return;
         }
 
-        return $body;
+        throw new HttpException($status, $originalUrl);
+    }
+
+    private static function isChunked(string $head): bool
+    {
+        return stripos($head, 'Transfer-Encoding: chunked') !== false;
     }
 
     /**
@@ -608,20 +704,20 @@ final class Async
     private static function decodeChunked(string $buffer): string
     {
         $out = '';
+        [$line, $buffer] = self::readLine($buffer, 'Malformed chunked body (missing size line)');
+        $len = self::parseChunkSize($line);
 
-        while (true) {
-            [$line, $buffer] = self::readLine($buffer, 'Malformed chunked body (missing size line)');
-            $len = self::parseChunkSize($line);
-
-            if ($len === 0) {
-                // Trailers may follow; validate framing but ignore contents.
-                self::consumeTrailer($buffer);
-                return $out;
-            }
-
+        while ($len > 0) {
             [$chunk, $buffer] = self::readChunk($buffer, $len);
             $out .= $chunk;
+
+            [$line, $buffer] = self::readLine($buffer, 'Malformed chunked body (missing size line)');
+            $len = self::parseChunkSize($line);
         }
+
+        // Trailers may follow; validate framing but ignore contents.
+        self::consumeTrailer($buffer);
+        return $out;
     }
 
     /**
@@ -629,27 +725,21 @@ final class Async
      */
     private static function readLine(string $buffer, string $error): array
     {
-        $lineEnd = strpos($buffer, "\r\n");
-        if ($lineEnd === false) {
+        $parts = explode("\r\n", $buffer, 2);
+        if (!isset($parts[1])) {
             throw new RuntimeException($error);
         }
 
-        $line = substr($buffer, 0, $lineEnd);
-        $rest = substr($buffer, $lineEnd + 2);
-
-        return [$line, $rest];
+        return [$parts[0], $parts[1]];
     }
 
     private static function parseChunkSize(string $line): int
     {
-        // Ignore chunk extensions: "<hex>;<ext>"
-        // @infection-ignore-all
-        $sizeHex = trim(explode(';', $line, 2)[0]);
-        if ($sizeHex === '' || preg_match('/\A[0-9a-fA-F]+\z/', $sizeHex) !== 1) {
+        if (preg_match('/\A\s*([0-9a-fA-F]+)\s*(?:;.*)?\z/', $line, $matches) !== 1) {
             throw new RuntimeException('Malformed chunked body (invalid chunk size)');
         }
 
-        $len = hexdec($sizeHex);
+        $len = hexdec($matches[1]);
         if (!is_int($len)) {
             throw new RuntimeException('Malformed chunked body (invalid chunk size)');
         }
@@ -662,33 +752,26 @@ final class Async
      */
     private static function readChunk(string $buffer, int $len): array
     {
-        if (strlen($buffer) < $len + 2) {
+        $expected = $len + 2;
+        if (strlen($buffer) < $expected) {
             throw new RuntimeException('Malformed chunked body (incomplete chunk)');
         }
-
-        $chunk = substr($buffer, 0, $len);
-        $buffer = substr($buffer, $len);
-
-        if (!str_starts_with($buffer, "\r\n")) {
+        [$chunk, $rest] = self::readLine($buffer, 'Malformed chunked body (missing CRLF after chunk)');
+        if (strlen($chunk) !== $len) {
             throw new RuntimeException('Malformed chunked body (missing CRLF after chunk)');
         }
 
-        return [$chunk, substr($buffer, 2)];
+        return [$chunk, $rest];
     }
 
     private static function consumeTrailer(string $buffer): void
     {
-        while (true) {
+        do {
             [$line, $buffer] = self::readLine($buffer, 'Malformed chunked body (invalid trailer)');
-            if ($line !== '') {
-                continue;
-            }
+        } while ($line !== '');
 
-            if ($buffer !== '') {
-                throw new RuntimeException('Malformed chunked body (invalid trailer)');
-            }
-
-            return;
+        if ($buffer !== '') {
+            throw new RuntimeException('Malformed chunked body (invalid trailer)');
         }
     }
 }
