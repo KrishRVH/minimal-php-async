@@ -1,36 +1,39 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/` contains the library code under the `Krvh\MinimalPhpAsync\` namespace (core runtime, tasks, timers, IO helpers).
-- `tests/` holds PHPUnit tests; shared fixtures and helpers live in `tests/Support/`.
-- `benchmarks/` includes phpbench scenarios for performance checks.
-- `fuzz/` contains fuzzing harnesses and the input corpus.
-- `scripts/` provides helper scripts for coverage and mutation testing.
-- Root configs like `phpunit.xml`, `phpcs.xml`, `phpstan.neon`, `psalm.xml`, and `deptrac.yaml` define quality gates.
+- `src/`: runtime, Async API, and internal helpers (namespace `Krvh\MinimalPhpAsync\`).
+- `tests/`: PHPUnit tests; shared helpers live in `tests/Support/`.
+- `benchmarks/`: PHPBench cases; `fuzz/`: php-fuzzer harness and corpus.
+- `scripts/`: helper runners for coverage, infection, and BC checks.
+- Config: `phpunit.xml`, `phpcs.xml`, `phpstan.neon`, `psalm.xml`, `deptrac.yaml`, `infection.json5`, `rector.php`.
 
 ## Build, Test, and Development Commands
-This is a Composer-managed library (PHP >= 8.5). Common workflows:
-- `composer test` runs PHPUnit.
-- `composer lint` runs style checks plus static analysis and dependency boundaries.
-- `composer check` runs `lint` and `test` as a quick gate.
-- `composer ci` runs checks and mutation testing.
-- `composer coverage` generates coverage via `scripts/coverage.sh`.
-- `composer bench` runs phpbench; `composer fuzz:smoke` runs a short fuzz pass.
+- `composer test`: run PHPUnit.
+- `composer lint`: run `phpcs`, `phpmd`, `phpstan`, `psalm`, `phan`, and `deptrac`.
+- `composer check`: lint + tests.
+- `composer ci`: check + mutation tests.
+- `composer coverage`: generate coverage (requires Xdebug or pcov).
+- `composer infection`: mutation testing via `scripts/infection.php`.
+- `composer bench`: run PHPBench benchmarks.
+- `composer fuzz:smoke`: quick fuzz pass.
+- `composer deep-check`: full suite including dependency and BC checks.
 
 ## Coding Style & Naming Conventions
-- PSR-12 with 4-space indentation and `declare(strict_types=1)`.
-- Require type hints for parameters, properties, and return values.
-- Keep line length under 120 characters (hard cap 150).
-- Use trailing commas in multi-line calls/definitions and avoid Yoda comparisons.
-- Avoid superglobals and debug/exit helpers (`var_dump`, `print_r`, `die`, `exit`).
-- Classes in `src/` follow PSR-4 naming; tests are `*Test.php`.
+- PSR-12 baseline with strict typing; keep `declare(strict_types=1);`.
+- 4-space indentation, line length 120 soft / 150 hard (`phpcs.xml`).
+- Prefer typed properties/params/returns; avoid forbidden debug functions (`var_dump`, `die`, etc.).
+- Classes in `src/` use StudlyCase; tests named `*Test.php`.
 
 ## Testing Guidelines
-- PHPUnit is configured to fail on warnings, risky tests, and global-state leaks.
-- Keep tests deterministic and isolated; prefer helpers in `tests/Support/`.
-- For mutation testing use `composer infection` (runs via `scripts/infection.sh`).
+- Framework: PHPUnit (see `phpunit.xml`).
+- Place tests in `tests/` mirroring `src/` structure; helpers belong in `tests/Support/`.
+- Mutation targets are strict (MSI >= 90, covered MSI >= 95); update tests when changing behavior.
+
+## Architecture & Constraints
+- `Async` is the public facade; `Runtime`, `Task`, and DTOs are internal.
+- Layering is enforced by `deptrac.yaml`; keep internal dependencies one-way.
 
 ## Commit & Pull Request Guidelines
-- Keep commit messages short and descriptive (current history uses brief sentence-case summaries).
-- PRs should include a concise summary, rationale, and the commands you ran (for example `composer test` and `composer lint`).
-- Link relevant issues and add tests/benchmarks when changing runtime behavior.
+- Commit history shows short, descriptive messages without prefixes; keep them concise and action-oriented (e.g., "fix timer cancellation").
+- PRs should include a clear summary, rationale, and the checks run (at least `composer test`; add `composer lint` for non-trivial changes).
+- Mention any API changes and update docs/tests accordingly.
