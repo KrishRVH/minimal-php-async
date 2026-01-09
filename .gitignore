@@ -7,6 +7,9 @@
 .psalm-cache/
 .rector-cache/
 /.pdepend/
+/build/
+/tmp/
+/.tmp/
 /fuzz/corpus
 /fuzz/coverage/
 /fuzz/crash-*.txt
