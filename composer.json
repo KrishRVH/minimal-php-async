@@ -102,6 +102,36 @@
     "test": "phpunit",
     "unused": "composer-unused"
   },
+  "scripts-descriptions": {
+    "analyze": "Run static analysis (PHPStan + Psalm + Phan).",
+    "backward-compatibility": "Check for backward-compatibility breaks against the previous version/API.",
+    "bench": "Run microbenchmarks with PHPBench (aggregate report).",
+    "check": "Run the standard local checks (lint + tests).",
+    "ci": "Run CI pipeline (check + mutation testing).",
+    "coverage": "Run test suite with coverage reporting (via scripts/coverage.php).",
+    "deep-check": "Run the full, expensive quality gate (normalize, lint, coverage, mutation, benches, fuzz smoke, deps, rector dry-run, BC check).",
+    "dependency-analyser": "Analyze dependency usage correctness (shipmonk/composer-dependency-analyser).",
+    "deps": "Run dependency hygiene suite (dependency analyser + unused deps + require-check).",
+    "deptrac": "Run architecture/dependency rules analysis (Deptrac).",
+    "fuzz": "Run fuzzing over the async parser target using php-fuzzer.",
+    "fuzz:coverage": "Generate fuzz coverage report for the async parser target.",
+    "fuzz:smoke": "Run a short fuzzing smoke test (bounded runs/timeout) for CI confidence.",
+    "infection": "Run mutation testing (via scripts/infection.php).",
+    "lint": "Run lint suite (style + static analysis + architecture checks).",
+    "normalize:check": "Verify composer.json is normalized (dry-run + diff).",
+    "phan": "Run Phan static analysis (using local .phan/phan.phar).",
+    "phpcbf": "Auto-fix coding standard violations (PHPCBF).",
+    "phpcs": "Check coding standards (PHPCS).",
+    "phpmd": "Run PHPMD ruleset checks on src/.",
+    "phpstan": "Run PHPStan analysis.",
+    "psalm": "Run Psalm analysis.",
+    "rector": "Apply Rector automated refactorings.",
+    "rector:dry": "Preview Rector refactorings without modifying files (dry-run).",
+    "require-check": "Verify composer.json requirements match actual used symbols (composer-require-checker).",
+    "style": "Run style checks (PHPCS + PHPMD).",
+    "test": "Run unit tests (PHPUnit).",
+    "unused": "Detect unused composer dependencies (composer-unused)."
+  },
   "autoload": {
     "psr-4": {
       "Krvh\\MinimalPhpAsync\\": "src/"
