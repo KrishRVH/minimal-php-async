@@ -1,119 +1,115 @@
 {
-    "name": "krvh/minimal-php-async",
-    "description": "Minimal learning Async implementation in PHP 8.5",
-    "license": "MIT",
-    "type": "library",
-    "authors": [
-        {
-            "name": "krvh"
-        }
+  "license": "MIT",
+  "name": "krvh/minimal-php-async",
+  "description": "Minimal learning Async implementation in PHP 8.5",
+  "type": "library",
+  "authors": [{"name": "krvh"}],
+  "config": {
+    "allow-plugins": {
+      "dealerdirect/phpcodesniffer-composer-installer": true,
+      "ergebnis/composer-normalize": true,
+      "infection/extension-installer": true,
+      "phpstan/extension-installer": true
+    },
+    "sort-packages": true
+  },
+  "require": {
+    "php": ">=8.5"
+  },
+  "require-dev": {
+    "ext-pcntl": "*",
+    "deptrac/deptrac": "^4.4.0",
+    "ergebnis/composer-normalize": "^2.48.2",
+    "icanhazstring/composer-unused": "^0.9.5",
+    "infection/infection": "^0.32.0",
+    "maglnet/composer-require-checker": "^4.20.0",
+    "nikic/php-fuzzer": "^0.0.11",
+    "phpbench/phpbench": "^1.4.3",
+    "phpmd/phpmd": "^2.15.0",
+    "phpstan/extension-installer": "^1.4.3",
+    "phpstan/phpstan": "^2.1.33",
+    "phpstan/phpstan-phpunit": "^2.0.11",
+    "phpstan/phpstan-strict-rules": "^2.0.7",
+    "phpunit/phpunit": "^12.5.4",
+    "psalm/plugin-phpunit": "^0.19.5",
+    "rector/rector": "^2.3.0",
+    "roave/backward-compatibility-check": "^8.17.0",
+    "roave/infection-static-analysis-plugin": "^1.43.0",
+    "roave/security-advisories": "dev-latest",
+    "shipmonk/composer-dependency-analyser": "^1.8.4",
+    "slevomat/coding-standard": "^8.26.0",
+    "squizlabs/php_codesniffer": "^4.0.1",
+    "vimeo/psalm": "^6.14.3"
+  },
+  "scripts": {
+    "analyze": [
+      "@phpstan",
+      "@psalm",
+      "@phan"
     ],
-    "require": {
-        "php": ">=8.5"
-    },
-    "require-dev": {
-        "ext-pcntl": "*",
-        "deptrac/deptrac": "^4.4.0",
-        "ergebnis/composer-normalize": "^2.48.2",
-        "icanhazstring/composer-unused": "^0.9.5",
-        "infection/infection": "^0.32.0",
-        "maglnet/composer-require-checker": "^4.20.0",
-        "nikic/php-fuzzer": "^0.0.11",
-        "phpbench/phpbench": "^1.4.3",
-        "phpmd/phpmd": "^2.15.0",
-        "phpstan/extension-installer": "^1.4.3",
-        "phpstan/phpstan": "^2.1.33",
-        "phpstan/phpstan-phpunit": "^2.0.11",
-        "phpstan/phpstan-strict-rules": "^2.0.7",
-        "phpunit/phpunit": "^12.5.4",
-        "psalm/plugin-phpunit": "^0.19.5",
-        "rector/rector": "^2.3.0",
-        "roave/backward-compatibility-check": "^8.17.0",
-        "roave/infection-static-analysis-plugin": "^1.43.0",
-        "roave/security-advisories": "dev-latest",
-        "shipmonk/composer-dependency-analyser": "^1.8.4",
-        "slevomat/coding-standard": "^8.26.0",
-        "squizlabs/php_codesniffer": "^4.0.1",
-        "vimeo/psalm": "^6.14.3"
-    },
-    "autoload": {
-        "psr-4": {
-            "Krvh\\MinimalPhpAsync\\": "src/"
-        }
-    },
-    "autoload-dev": {
-        "psr-4": {
-            "Krvh\\MinimalPhpAsync\\Tests\\": "tests/"
-        }
-    },
-    "config": {
-        "allow-plugins": {
-            "dealerdirect/phpcodesniffer-composer-installer": true,
-            "ergebnis/composer-normalize": true,
-            "infection/extension-installer": true,
-            "phpstan/extension-installer": true
-        },
-        "sort-packages": true
-    },
-    "scripts": {
-        "analyze": [
-            "@phpstan",
-            "@psalm",
-            "@phan"
-        ],
-        "backward-compatibility": "php scripts/backward-compatibility.php",
-        "bench": "phpbench run --report=aggregate",
-        "check": [
-            "@lint",
-            "@test"
-        ],
-        "ci": [
-            "@check",
-            "@infection"
-        ],
-        "coverage": "php scripts/coverage.php",
-        "deep-check": [
-            "@normalize:check",
-            "@lint",
-            "@coverage",
-            "@infection",
-            "@bench",
-            "@fuzz:smoke",
-            "@deps",
-            "@rector:dry",
-            "@backward-compatibility"
-        ],
-        "dependency-analyser": "composer-dependency-analyser",
-        "deps": [
-            "@dependency-analyser",
-            "@unused",
-            "@require-check"
-        ],
-        "deptrac": "deptrac analyze",
-        "fuzz": "php-fuzzer fuzz fuzz/async-parse.php fuzz/corpus",
-        "fuzz:coverage": "php-fuzzer report-coverage fuzz/async-parse.php fuzz/corpus fuzz/coverage",
-        "fuzz:smoke": "php-fuzzer --max-runs=5000 --timeout=1 --len-control-factor=10 fuzz fuzz/async-parse.php fuzz/corpus",
-        "infection": "php scripts/infection.php",
-        "lint": [
-            "@style",
-            "@analyze",
-            "@deptrac"
-        ],
-        "normalize:check": "composer normalize --dry-run --diff",
-        "phan": "php .phan/phan.phar --color",
-        "phpcbf": "phpcbf",
-        "phpcs": "phpcs",
-        "phpmd": "HOME=. php -d error_reporting='E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED' vendor/bin/phpmd src text phpmd.xml",
-        "phpstan": "php -d disable_functions=proc_open vendor/bin/phpstan analyse --memory-limit=512M",
-        "psalm": "psalm",
-        "rector": "rector process",
-        "rector:dry": "rector process --dry-run",
-        "require-check": "composer-require-checker check",
-        "style": [
-            "@phpcs",
-            "@phpmd"
-        ],
-        "test": "phpunit",
-        "unused": "composer-unused"
+    "backward-compatibility": "php scripts/backward-compatibility.php",
+    "bench": "phpbench run --report=aggregate",
+    "check": [
+      "@lint",
+      "@test"
+    ],
+    "ci": [
+      "@check",
+      "@infection"
+    ],
+    "coverage": "php scripts/coverage.php",
+    "deep-check": [
+      "@normalize:check",
+      "@lint",
+      "@coverage",
+      "@infection",
+      "@bench",
+      "@fuzz:smoke",
+      "@deps",
+      "@rector:dry",
+      "@backward-compatibility"
+    ],
+    "dependency-analyser": "composer-dependency-analyser",
+    "deps": [
+      "@dependency-analyser",
+      "@unused",
+      "@require-check"
+    ],
+    "deptrac": "deptrac analyze",
+    "fuzz": "php-fuzzer fuzz fuzz/async-parse.php fuzz/corpus",
+    "fuzz:coverage": "php-fuzzer report-coverage fuzz/async-parse.php fuzz/corpus fuzz/coverage",
+    "fuzz:smoke": "php-fuzzer --max-runs=5000 --timeout=1 --len-control-factor=10 fuzz fuzz/async-parse.php fuzz/corpus",
+    "infection": "php scripts/infection.php",
+    "lint": [
+      "@style",
+      "@analyze",
+      "@deptrac"
+    ],
+    "normalize:check": "composer normalize --dry-run --diff",
+    "phan": "php .phan/phan.phar --color",
+    "phpcbf": "phpcbf",
+    "phpcs": "phpcs",
+    "phpmd": "HOME=. php -d error_reporting='E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED' vendor/bin/phpmd src text phpmd.xml",
+    "phpstan": "php -d disable_functions=proc_open vendor/bin/phpstan analyse --memory-limit=512M",
+    "psalm": "psalm",
+    "rector": "rector process",
+    "rector:dry": "rector process --dry-run",
+    "require-check": "composer-require-checker check",
+    "style": [
+      "@phpcs",
+      "@phpmd"
+    ],
+    "test": "phpunit",
+    "unused": "composer-unused"
+  },
+  "autoload": {
+    "psr-4": {
+      "Krvh\\MinimalPhpAsync\\": "src/"
     }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Krvh\\MinimalPhpAsync\\Tests\\": "tests/"
+    }
+  }
 }
